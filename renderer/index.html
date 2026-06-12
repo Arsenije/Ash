@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ash</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="searchwrap">
+        <div class="searchbar" id="searchbar">
+          <span id="chips" class="chips-row"></span>
+          <input id="q" type="text" autocomplete="off" spellcheck="false"
+                 placeholder="Search photos… or type a filter like “location”" />
+        </div>
+        <div id="suggest" class="suggest hidden"></div>
+      </div>
+      <nav class="tabs" role="group">
+        <button class="tab active" data-view="gallery">Gallery</button>
+        <button class="tab" data-view="themes">Themes</button>
+      </nav>
+      <span id="cost" class="cost" title="Estimated OpenAI spend for this library"></span>
+      <button id="settings-btn" class="icon-btn" title="Settings" aria-label="Settings">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="3"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </button>
+    </header>
+
+    <main class="layout">
+      <section class="content">
+        <div id="status" class="status"></div>
+        <div id="grid" class="grid"></div>
+        <div id="themes" class="themes hidden"></div>
+      </section>
+    </main>
+
+    <!-- Detail modal -->
+    <div id="detail" class="modal hidden">
+      <div class="modal-card">
+        <button class="close" data-close>✕</button>
+        <img id="d-img" class="d-img" />
+        <div class="d-body">
+          <h2 id="d-title"></h2>
+          <p id="d-desc" class="d-desc"></p>
+          <div id="d-attrs" class="d-attrs"></div>
+          <button id="d-reveal" class="btn small">Show in Finder</button>
+          <h3>Related</h3>
+          <div id="d-related" class="related"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Settings modal -->
+    <div id="settings" class="modal hidden">
+      <div class="modal-card small">
+        <button class="close" data-close>✕</button>
+        <h2>Settings</h2>
+        <label class="field">OpenAI API key
+          <input id="key-input" type="password" placeholder="sk-…" />
+        </label>
+        <p class="hint">Stored locally and encrypted. Used to describe photos and power search.</p>
+        <button id="key-save" class="btn">Save & restart engine</button>
+        <div id="key-status" class="hint"></div>
+      </div>
+    </div>
+
+    <div id="toast" class="toast hidden">
+      <div class="toast-msg"></div>
+      <div class="toast-bar hidden"><i></i></div>
+    </div>
+
+    <div id="drop-hint" class="drop-hint hidden">Drop photos to add them</div>
+    <script src="app.js"></script>
+  </body>
+</html>

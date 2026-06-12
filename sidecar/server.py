@@ -1,0 +1,527 @@
+"""FastAPI sidecar: ingest photos into khora and serve the gallery/search API.
+
+Runs on 127.0.0.1 only. The Electron app spawns this process, waits on
+``/health``, and proxies the renderer's requests here.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import uuid
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from PIL import Image, ImageOps
+from pydantic import BaseModel
+
+import khora_client as kc
+from expertise import ENTITY_TYPES, PHOTO_EXPERTISE, RELATIONSHIP_TYPES
+from vision import describe_image
+
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
+INGEST_CONCURRENCY = 4
+THUMB_SIZE = (512, 512)
+
+app = FastAPI(title="photo-gallery sidecar")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 127.0.0.1-only service; renderer is a local file://
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory ingest job tracking (single-user desktop app).
+_jobs: dict[str, dict[str, Any]] = {}
+
+# ---------------------------------------------------------------------------
+# OpenAI spend tracking — measured token tallies, persisted per library.
+# Prices are USD per 1M tokens (input, output); approximate, edit as needed.
+# ---------------------------------------------------------------------------
+PRICING: dict[str, tuple[float, float]] = {
+    "gpt-4o-mini": (0.15, 0.60),
+    "gpt-4o": (2.50, 10.00),
+    "text-embedding-3-small": (0.02, 0.0),
+    "text-embedding-3-large": (0.13, 0.0),
+}
+_DEFAULT_PRICE = (0.15, 0.60)
+_USAGE_FILE = kc.DATA_DIR / "usage.json"
+_usage: dict[str, Any] = {"by_model": {}, "photos": 0}
+
+
+def _load_usage() -> None:
+    global _usage
+    try:
+        _usage = json.loads(_USAGE_FILE.read_text())
+    except Exception:
+        _usage = {}
+    _usage.setdefault("by_model", {})
+    _usage.setdefault("photos", 0)
+
+
+def _persist_usage() -> None:
+    try:
+        _USAGE_FILE.write_text(json.dumps(_usage))
+    except Exception:
+        pass
+
+
+def _record_usage(model: str, inp: int, out: int) -> None:
+    m = _usage["by_model"].setdefault(model, {"input": 0, "output": 0})
+    m["input"] += int(inp or 0)
+    m["output"] += int(out or 0)
+
+
+def _price_for(model: str) -> tuple[float, float]:
+    for key, rates in PRICING.items():
+        if key in model:
+            return rates
+    return _DEFAULT_PRICE
+
+
+def _estimated_cost() -> float:
+    total = 0.0
+    for model, tok in _usage["by_model"].items():
+        in_rate, out_rate = _price_for(model)
+        total += tok["input"] / 1_000_000 * in_rate + tok["output"] / 1_000_000 * out_rate
+    return total
+
+
+@app.on_event("startup")
+async def _startup() -> None:
+    await kc.startup()
+    _load_usage()
+
+
+@app.on_event("shutdown")
+async def _shutdown() -> None:
+    await kc.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def _hash_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _photo_datetime(path: Path) -> datetime:
+    """EXIF DateTimeOriginal if present, else file mtime. Always tz-aware UTC."""
+    try:
+        exif = Image.open(path).getexif()
+        ifd = exif.get_ifd(0x8769)  # Exif IFD
+        raw = ifd.get(36867) or ifd.get(36868) or exif.get(306)
+        if raw:
+            return datetime.strptime(str(raw), "%Y:%m:%d %H:%M:%S").replace(tzinfo=UTC)
+    except Exception:
+        pass
+    return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+
+
+def _make_thumbnail(path: Path, ext_id: str) -> None:
+    out = kc.THUMBS_DIR / f"{ext_id}.webp"
+    if out.exists():
+        return
+    img = ImageOps.exif_transpose(Image.open(path))
+    img.thumbnail(THUMB_SIZE)
+    img.convert("RGB").save(out, "WEBP", quality=80)
+
+
+def _custom(meta: dict[str, Any] | None) -> dict[str, Any]:
+    return (meta or {}).get("custom", {}) or {}
+
+
+def _photo_dto(doc: Any, *, description: str | None = None, score: float | None = None) -> dict[str, Any]:
+    """Map a Document or DocumentProjection to the gallery DTO (defensive getattr)."""
+    meta = getattr(doc, "metadata", None) or {}
+    c = _custom(meta)
+    ext = getattr(doc, "external_id", None)
+    st = getattr(doc, "source_timestamp", None)
+    return {
+        "id": str(getattr(doc, "id")),
+        "external_id": ext,
+        "thumb_url": f"/thumb/{ext}" if ext else None,
+        "src": getattr(doc, "source_url", None),
+        "title": getattr(doc, "title", None),
+        "description": description if description is not None else (getattr(doc, "content", "") or ""),
+        "location": c.get("location") or None,
+        "objects": c.get("objects", []),
+        "animals": c.get("animals", []),
+        "scene": c.get("scene") or None,
+        "tags": c.get("tags", []),
+        "occurred_at": c.get("occurred_at") or (st.isoformat() if st else None),
+        "score": score,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    try:
+        ns = kc.namespace()
+    except RuntimeError:
+        raise HTTPException(503, "starting")
+    return {"status": "ok", "namespace": str(ns), "has_openai_key": bool(os.environ.get("OPENAI_API_KEY"))}
+
+
+@app.get("/usage")
+async def usage() -> dict[str, Any]:
+    by = _usage["by_model"]
+    return {
+        "cost_usd": round(_estimated_cost(), 4),
+        "input_tokens": sum(m["input"] for m in by.values()),
+        "output_tokens": sum(m["output"] for m in by.values()),
+        "photos": _usage["photos"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ingest
+# ---------------------------------------------------------------------------
+class IngestRequest(BaseModel):
+    paths: list[str]
+
+
+def _expand_paths(paths: list[str]) -> list[Path]:
+    out: list[Path] = []
+    for p in paths:
+        path = Path(p).expanduser()
+        if path.is_dir():
+            out.extend(f for f in path.rglob("*") if f.suffix.lower() in IMAGE_EXTS)
+        elif path.suffix.lower() in IMAGE_EXTS and path.is_file():
+            out.append(path)
+    # de-dupe while preserving order
+    seen: set[str] = set()
+    uniq: list[Path] = []
+    for f in out:
+        resolved = f.resolve()
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            uniq.append(resolved)
+    return uniq
+
+
+@app.post("/ingest")
+async def ingest(req: IngestRequest) -> dict[str, Any]:
+    files = _expand_paths(req.paths)
+    job_id = uuid.uuid4().hex
+    _jobs[job_id] = {
+        "total": len(files),
+        "done": 0,
+        "skipped": 0,
+        "failed": 0,
+        "status": "running",
+        "errors": [],
+        "items": {str(f): {"status": "pending"} for f in files},  # per-file status
+    }
+    asyncio.create_task(_run_ingest(job_id, files))
+    return {"job_id": job_id, "paths": [str(f) for f in files]}
+
+
+@app.get("/ingest/status")
+async def ingest_status(job_id: str) -> dict[str, Any]:
+    job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "unknown job")
+    return job
+
+
+async def _run_ingest(job_id: str, files: list[Path]) -> None:
+    job = _jobs[job_id]
+    # Idempotency: external_id == file content hash; skip already-ingested files.
+    existing = {d.external_id for d in await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)}
+    sem = asyncio.Semaphore(INGEST_CONCURRENCY)
+
+    async def one(path: Path) -> None:
+        key = str(path)
+        async with sem:
+            try:
+                job["items"][key] = {"status": "scanning"}
+                ext_id = _hash_file(path)
+                if ext_id in existing:
+                    job["skipped"] += 1
+                    job["items"][key] = {"status": "skipped", "ext_id": ext_id}
+                    return
+                dt = _photo_datetime(path)
+                desc, vusage = await describe_image(path)
+                _record_usage(vusage["model"], vusage["input"], vusage["output"])
+                await asyncio.to_thread(_make_thumbnail, path, ext_id)
+                result = await kc.kb().remember(
+                    content=desc["description"] or f"Photo: {path.name}",
+                    namespace=kc.namespace(),
+                    title=path.name,
+                    source_type="photo",
+                    source_url=str(path.resolve()),
+                    source_timestamp=dt,
+                    external_id=ext_id,
+                    metadata={
+                        "custom": {
+                            "location": desc["location"],
+                            "objects": desc["objects"],
+                            "animals": desc["animals"],
+                            "scene": desc["scene"],
+                            "tags": desc["tags"],
+                            "occurred_at": dt.isoformat(),
+                            "filename": path.name,
+                        }
+                    },
+                    entity_types=ENTITY_TYPES,
+                    relationship_types=RELATIONSHIP_TYPES,
+                    expertise=PHOTO_EXPERTISE,
+                )
+                for u in result.llm_usage:  # extraction + embedding tokens from khora
+                    _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
+                _usage["photos"] += 1
+                _persist_usage()
+                existing.add(ext_id)
+                job["done"] += 1
+                job["items"][key] = {
+                    "status": "done",
+                    "ext_id": ext_id,
+                    "doc_id": str(result.document_id),
+                }
+            except Exception as exc:  # keep the batch going; record the failure
+                msg = f"{type(exc).__name__}: {exc}"
+                job["failed"] += 1
+                job["errors"].append({"path": str(path), "error": msg})
+                job["items"][key] = {"status": "failed", "error": msg}
+
+    await asyncio.gather(*(one(f) for f in files))
+    job["status"] = "done"
+
+
+# ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
+def _build_filter(
+    location: str | None,
+    scene: str | None,
+    objects: list[str],
+    tags: list[str],
+    date_from: str | None,
+    date_to: str | None,
+) -> dict[str, Any] | None:
+    f: dict[str, Any] = {}
+    if location:
+        f["metadata.custom.location"] = location
+    if scene:
+        f["metadata.custom.scene"] = scene
+    if objects:
+        f["metadata.custom.objects"] = {"$in": objects}
+    if tags:
+        f["metadata.custom.tags"] = {"$in": tags}
+    if date_from or date_to:
+        rng: dict[str, str] = {}
+        if date_from:
+            rng["$gte"] = date_from
+        if date_to:
+            rng["$lte"] = date_to
+        f["metadata.custom.occurred_at"] = rng
+    return f or None
+
+
+def _py_match(
+    c: dict[str, Any],
+    location: str | None,
+    scene: str | None,
+    objects: list[str],
+    tags: list[str],
+    date_from: str | None,
+    date_to: str | None,
+) -> bool:
+    if location and (c.get("location") or "").lower() != location.lower():
+        return False
+    if scene and (c.get("scene") or "").lower() != scene.lower():
+        return False
+    if objects and not {o.lower() for o in c.get("objects", [])} & {o.lower() for o in objects}:
+        return False
+    if tags and not {t.lower() for t in c.get("tags", [])} & {t.lower() for t in tags}:
+        return False
+    oa = c.get("occurred_at") or ""
+    if date_from and oa < date_from:
+        return False
+    if date_to and oa > date_to:
+        return False
+    return True
+
+
+@app.get("/gallery")
+async def gallery(limit: int = 500) -> dict[str, Any]:
+    docs = await kc.kb().list_documents(namespace=kc.namespace(), limit=limit)
+    photos = [_photo_dto(d) for d in docs]
+    photos.sort(key=lambda p: p["occurred_at"] or "", reverse=True)
+    return {"photos": photos, "mode": "gallery"}
+
+
+@app.get("/search")
+async def search(
+    q: str = "",
+    location: str | None = None,
+    scene: str | None = None,
+    objects: list[str] = Query(default=[]),
+    tags: list[str] = Query(default=[]),
+    date_from: str | None = None,
+    date_to: str | None = None,
+    limit: int = 200,
+) -> dict[str, Any]:
+    q = q.strip()
+
+    if q:
+        flt = _build_filter(location, scene, objects, tags, date_from, date_to)
+        result = await kc.kb().recall(q, namespace=kc.namespace(), limit=limit, filter=flt)
+        docs = {d.id: d for d in result.documents}
+        photos: list[dict[str, Any]] = []
+        seen: set[Any] = set()
+        for ch in result.chunks:  # score-sorted; one photo == one document
+            if ch.document_id in seen:
+                continue
+            seen.add(ch.document_id)
+            doc = docs.get(ch.document_id)
+            if doc is not None:
+                photos.append(_photo_dto(doc, description=ch.content, score=ch.score))
+        return {"photos": photos, "mode": "semantic"}
+
+    # Filter-only browse: enumerate all docs and match in Python (true "show all matching").
+    docs_all = await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)
+    photos = [
+        _photo_dto(d)
+        for d in docs_all
+        if _py_match(_custom(getattr(d, "metadata", None)), location, scene, objects, tags, date_from, date_to)
+    ]
+    photos.sort(key=lambda p: p["occurred_at"] or "", reverse=True)
+    return {"photos": photos[:limit], "mode": "browse"}
+
+
+@app.get("/facets")
+async def facets() -> dict[str, list[str]]:
+    docs = await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)
+    locations: set[str] = set()
+    scenes: set[str] = set()
+    objects: set[str] = set()
+    animals: set[str] = set()
+    tags: set[str] = set()
+    for d in docs:
+        c = _custom(getattr(d, "metadata", None))
+        if c.get("location"):
+            locations.add(c["location"])
+        if c.get("scene"):
+            scenes.add(c["scene"])
+        objects.update(c.get("objects", []))
+        animals.update(c.get("animals", []))
+        tags.update(c.get("tags", []))
+    return {
+        "location": sorted(locations),
+        "scene": sorted(scenes),
+        "objects": sorted(objects),
+        "animals": sorted(animals),
+        "tags": sorted(tags),
+    }
+
+
+_TYPE_LABELS = {"ANIMAL": "Animals", "PLACE": "Places", "OBJECT": "Objects", "SCENE": "Scenes"}
+
+
+@app.get("/themes")
+async def themes(limit_per_theme: int = 60) -> dict[str, Any]:
+    """Group photos into themes, each carrying its member photos (with thumbnails).
+
+    Two kinds: category groups (Animals/Places/Objects/Scenes — always useful) and
+    finer recurring-entity themes (the same specific subject across 2+ photos)."""
+    ns = kc.namespace()
+    docs = await kc.kb().list_documents(namespace=ns, limit=100000)
+    docmap = {str(d.id): d for d in docs}
+
+    def photos_for(ids: set[str]) -> list[dict[str, Any]]:
+        return [_photo_dto(docmap[i]) for i in list(ids)[:limit_per_theme] if i in docmap]
+
+    ents_by_type = {
+        t: await kc.kb().list_entities(namespace=ns, entity_type=t, limit=2000, include_sources=True)
+        for t in ENTITY_TYPES
+    }
+
+    themes: list[dict[str, Any]] = []
+    # Category groups first (>=2 photos) — the reliable, always-populated view.
+    for t in ENTITY_TYPES:
+        ids: set[str] = set()
+        for e in ents_by_type[t]:
+            ids.update(str(x) for x in e.source_document_ids)
+        if len(ids) >= 2:
+            themes.append({"label": _TYPE_LABELS[t], "type": t, "kind": "category", "count": len(ids), "photos": photos_for(ids)})
+    # Finer recurring-entity themes (same specific subject in 2+ photos).
+    entity_themes: list[dict[str, Any]] = []
+    for t in ENTITY_TYPES:
+        for e in ents_by_type[t]:
+            ids = {str(x) for x in e.source_document_ids}
+            if len(ids) >= 2:
+                entity_themes.append({"label": e.name, "type": t, "kind": "entity", "count": len(ids), "photos": photos_for(ids)})
+    entity_themes.sort(key=lambda x: -x["count"])
+    themes.extend(entity_themes)
+    return {"themes": themes}
+
+
+@app.get("/related/{doc_id}")
+async def related(doc_id: str, limit: int = 12) -> dict[str, Any]:
+    from collections import Counter
+
+    target = uuid.UUID(doc_id)
+    counts: Counter[Any] = Counter()
+    for t in ENTITY_TYPES:
+        for e in await kc.kb().list_entities(
+            namespace=kc.namespace(), entity_type=t, limit=1000, include_sources=True
+        ):
+            ids = set(e.source_document_ids)
+            if target in ids:
+                for other in ids:
+                    if other != target:
+                        counts[other] += 1
+    photos: list[dict[str, Any]] = []
+    for other_id, shared in counts.most_common(limit):
+        doc = await kc.kb().get_document(other_id, namespace=kc.namespace())
+        if doc is not None:
+            dto = _photo_dto(doc)
+            dto["shared_entities"] = shared
+            photos.append(dto)
+    return {"photos": photos}
+
+
+@app.get("/photo/{doc_id}")
+async def photo(doc_id: str) -> dict[str, Any]:
+    doc = await kc.kb().get_document(uuid.UUID(doc_id), namespace=kc.namespace())
+    if doc is None:
+        raise HTTPException(404, "not found")
+    dto = _photo_dto(doc)
+    dto["exists_on_disk"] = bool(dto["src"]) and Path(dto["src"]).exists()
+    return dto
+
+
+@app.get("/image/{doc_id}")
+async def image(doc_id: str) -> FileResponse:
+    doc = await kc.kb().get_document(uuid.UUID(doc_id), namespace=kc.namespace())
+    if doc is None or not doc.source_url:
+        raise HTTPException(404, "not found")
+    p = Path(doc.source_url)
+    if not p.exists():
+        raise HTTPException(410, "original file missing")
+    return FileResponse(p)
+
+
+@app.get("/thumb/{ext_id}")
+async def thumb(ext_id: str) -> FileResponse:
+    safe = "".join(ch for ch in ext_id if ch in "0123456789abcdef")  # hash only
+    out = kc.THUMBS_DIR / f"{safe}.webp"
+    if not out.exists():
+        raise HTTPException(404, "no thumbnail")
+    return FileResponse(out, media_type="image/webp")

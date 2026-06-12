@@ -1,0 +1,27 @@
+# Node / Electron
+node_modules/
+dist/
+build/
+out/
+*.log
+
+# Python sidecar
+sidecar/.venv/
+__pycache__/
+*.pyc
+
+# Local runtime data (khora DB, vectors, thumbnails, namespace) — never publish
+data/
+*.db
+*.db-shm
+*.db-wal
+*.lance/
+
+# Secrets / settings
+.env
+.env.*
+settings.json
+usage.json
+
+# OS
+.DS_Store

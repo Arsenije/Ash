@@ -1,0 +1,13 @@
+{
+  "name": "ash",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ash — local photo gallery: drag-drop photos, describe with OpenAI, search/filter via khora (embedded, offline).",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.2.0"
+  }
+}
