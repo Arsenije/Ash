@@ -4,7 +4,15 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 
 contextBridge.exposeInMainWorld("api", {
   getConfig: () => ipcRenderer.invoke("get-config"),
-  saveKey: (key) => ipcRenderer.invoke("save-key", key),
+  engineStatus: () => ipcRenderer.invoke("engine-status"),
+  engineSet: () => ipcRenderer.invoke("engine-set"),
+  // Download the model GGUFs; progress arrives via onModelProgress until it resolves.
+  downloadModels: () => ipcRenderer.invoke("download-models"),
+  onModelProgress: (cb) => {
+    const handler = (_e, p) => cb(p);
+    ipcRenderer.on("model-download-progress", handler);
+    return () => ipcRenderer.removeListener("model-download-progress", handler);
+  },
   pickPaths: () => ipcRenderer.invoke("pick-paths"),
   reveal: (p) => ipcRenderer.invoke("reveal", p),
   // Resolve absolute filesystem paths for dragged-in File objects.

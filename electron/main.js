@@ -1,10 +1,11 @@
 "use strict";
 
-const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const { spawn } = require("node:child_process");
 
 app.setName("Ash");
 const net = require("node:net");
+const os = require("node:os");
 const path = require("node:path");
 const fs = require("node:fs");
 
@@ -15,31 +16,222 @@ const PY = path.join(SIDECAR_DIR, ".venv", "bin", "python");
 let mainWindow = null;
 let sidecar = null;
 let sidecarPort = 0;
+let llamaSwap = null;
+let swapPort = 0;
 let dataDir = "";
+let modelsDir = "";
+let swapConfigPath = "";
 let settingsPath = "";
 
 // ---------------------------------------------------------------------------
-// Settings (OpenAI key) — encrypted at rest via safeStorage when available.
+// Engine config — the models that describe photos and power search.
+// Ash is local-only: GGUF models run on this machine via llama.cpp, fronted by
+// llama-swap (one OpenAI-compatible endpoint, swaps models on demand). The
+// chosen engine is persisted in settings.json under "engine".
 // ---------------------------------------------------------------------------
-function loadKey() {
+
+// llama-swap model ids (what the sidecar/khora address) → how to fetch + serve.
+//   role "main" is the GGUF; vision also needs an "mmproj" projector GGUF.
+// repo/quant feed a HuggingFace API lookup so we don't hard-code filenames.
+const MODELS = {
+  vision: { label: "SmolVLM2 2.2B", repo: "ggml-org/SmolVLM2-2.2B-Instruct-GGUF", quant: "Q4_K_M", mmproj: true },
+  embed: { label: "Nomic Embed", repo: "nomic-ai/nomic-embed-text-v1.5-GGUF", quant: "Q4_K_M" },
+  text: { label: "Llama 3.2 1B", repo: "bartowski/Llama-3.2-1B-Instruct-GGUF", quant: "Q4_K_M" },
+};
+
+// The engine record persisted to settings. base_url is resolved at runtime from
+// the live llama-swap port, so it isn't stored here.
+const LOCAL_ENGINE = {
+  provider: "local",
+  vision_model: "vision",
+  text_model: "text",
+  embed_model: "embed",
+  embed_dim: 768, // nomic-embed-text-v1.5
+};
+
+function readSettings() {
   try {
-    const raw = JSON.parse(fs.readFileSync(settingsPath, "utf8"));
-    if (!raw.openai_key) return "";
-    if (raw.encrypted && safeStorage.isEncryptionAvailable()) {
-      return safeStorage.decryptString(Buffer.from(raw.openai_key, "base64"));
-    }
-    return raw.encrypted ? "" : raw.openai_key;
+    return JSON.parse(fs.readFileSync(settingsPath, "utf8"));
   } catch {
-    return "";
+    return {};
   }
 }
 
-function saveKey(key) {
-  const useEnc = safeStorage.isEncryptionAvailable();
-  const payload = useEnc
-    ? { encrypted: true, openai_key: safeStorage.encryptString(key).toString("base64") }
-    : { encrypted: false, openai_key: key };
-  fs.writeFileSync(settingsPath, JSON.stringify(payload), { mode: 0o600 });
+function writeSettings(obj) {
+  fs.writeFileSync(settingsPath, JSON.stringify(obj), { mode: 0o600 });
+}
+
+// The configured engine, or null when the user hasn't set up yet (first run).
+function loadEngine() {
+  return readSettings().engine || null;
+}
+
+function saveEngine(engine) {
+  const s = readSettings();
+  s.engine = engine;
+  writeSettings(s);
+}
+
+// Environment the sidecar needs to reach llama-swap. vision.py's OpenAI SDK
+// reads OPENAI_BASE_URL; khora's litellm needs the openai/ prefix + OPENAI_API_BASE.
+// Both point at llama-swap, which routes by the model name.
+function engineEnv(engine) {
+  if (!engine) return {};
+  const base = `http://127.0.0.1:${swapPort}/v1`;
+  return {
+    PHOTO_VISION_MODEL: engine.vision_model,
+    OPENAI_BASE_URL: base,
+    OPENAI_API_BASE: base,
+    OPENAI_API_KEY: "sk-local", // dummy; llama.cpp ignores it
+    KHORA_LLM_MODEL: `openai/${engine.text_model}`,
+    KHORA_EXTRACTION_MODEL: `openai/${engine.text_model}`,
+    KHORA_EMBED_MODEL: `openai/${engine.embed_model}`,
+    KHORA_EMBED_DIM: String(engine.embed_dim),
+  };
+}
+
+// Coarse hardware tier for the onboarding warning. Apple Silicon runs these
+// models on the GPU (Metal); Intel is CPU-only and much slower.
+function hardwareTier() {
+  const appleSilicon = (os.cpus()[0]?.model || "").includes("Apple");
+  const totalRamGB = Math.round(os.totalmem() / 1e9);
+  let tier = "good";
+  if (!appleSilicon) tier = "slow";
+  else if (totalRamGB < 8) tier = "lowram";
+  return { appleSilicon, totalRamGB, tier };
+}
+
+// ---------------------------------------------------------------------------
+// llama.cpp binaries — bundled in the app (Resources/bin), with dev fallbacks.
+// ---------------------------------------------------------------------------
+function findBin(name) {
+  const candidates = [
+    process.resourcesPath && path.join(process.resourcesPath, "bin", name),
+    path.join(ROOT, "vendor", "bin", name),
+    `/opt/homebrew/bin/${name}`,
+    `/usr/local/bin/${name}`,
+  ].filter(Boolean);
+  return candidates.find((p) => fs.existsSync(p)) || null;
+}
+
+function runtimeAvailable() {
+  return Boolean(findBin("llama-server") && findBin("llama-swap"));
+}
+
+// ---------------------------------------------------------------------------
+// Model files — local paths + HuggingFace download with progress.
+// ---------------------------------------------------------------------------
+function modelPath(key, role) {
+  return path.join(modelsDir, role === "mmproj" ? `${key}-mmproj.gguf` : `${key}.gguf`);
+}
+
+function modelsPresent() {
+  return Object.entries(MODELS).every(
+    ([key, m]) => fs.existsSync(modelPath(key, "main")) && (!m.mmproj || fs.existsSync(modelPath(key, "mmproj")))
+  );
+}
+
+// List a repo's files via the HF API, then pick the GGUF (or its mmproj).
+async function resolveHfFile(repo, quant, { mmproj = false } = {}) {
+  const res = await fetch(`https://huggingface.co/api/models/${repo}`);
+  if (!res.ok) throw new Error(`HuggingFace lookup failed for ${repo} (${res.status})`);
+  const data = await res.json();
+  const ggufs = (data.siblings || []).map((s) => s.rfilename).filter((f) => f.toLowerCase().endsWith(".gguf"));
+  if (mmproj) return ggufs.find((f) => f.toLowerCase().includes("mmproj")) || null;
+  const q = quant.toLowerCase();
+  return (
+    ggufs.find((f) => f.toLowerCase().includes(q) && !f.toLowerCase().includes("mmproj")) ||
+    ggufs.find((f) => !f.toLowerCase().includes("mmproj")) ||
+    null
+  );
+}
+
+function hfUrl(repo, file) {
+  return `https://huggingface.co/${repo}/resolve/main/${file}`;
+}
+
+// Stream a download to disk (with backpressure), reporting fraction complete.
+async function downloadTo(url, dest, onProgress) {
+  const res = await fetch(url);
+  if (!res.ok || !res.body) throw new Error(`download failed (${res.status})`);
+  const total = Number(res.headers.get("content-length")) || 0;
+  const tmp = `${dest}.part`;
+  const out = fs.createWriteStream(tmp);
+  let received = 0;
+  for await (const chunk of res.body) {
+    received += chunk.length;
+    if (!out.write(Buffer.from(chunk))) await new Promise((r) => out.once("drain", r));
+    if (total) onProgress(received / total);
+  }
+  await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+  fs.renameSync(tmp, dest);
+}
+
+// Download every model (skipping ones already on disk), reporting progress.
+async function downloadModels(onProgress) {
+  fs.mkdirSync(modelsDir, { recursive: true });
+  for (const [key, m] of Object.entries(MODELS)) {
+    const jobs = [{ role: "main", label: m.label }];
+    if (m.mmproj) jobs.push({ role: "mmproj", label: `${m.label} (vision projector)` });
+    for (const job of jobs) {
+      const dest = modelPath(key, job.role);
+      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) continue; // already have it
+      const file = await resolveHfFile(m.repo, m.quant, { mmproj: job.role === "mmproj" });
+      if (!file) throw new Error(`no ${job.role} GGUF found in ${m.repo}`);
+      onProgress({ model: job.label, fraction: 0 });
+      await downloadTo(hfUrl(m.repo, file), dest, (f) => onProgress({ model: job.label, fraction: f }));
+      onProgress({ model: job.label, fraction: 1 });
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// llama-swap — one OpenAI-compatible endpoint fronting per-model llama-server.
+// ---------------------------------------------------------------------------
+function writeSwapConfig() {
+  const server = findBin("llama-server");
+  const q = (p) => `"${p}"`;
+  // cmd is a YAML block scalar (|) so the quoted paths aren't parsed as YAML.
+  // ${PORT} is llama-swap's macro (assigned per backend) — keep it literal.
+  const cfg = `models:
+  vision:
+    ttl: 300
+    cmd: |
+      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("vision", "main"))} --mmproj ${q(modelPath("vision", "mmproj"))}
+  embed:
+    ttl: 300
+    cmd: |
+      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("embed", "main"))} --embedding
+  text:
+    ttl: 300
+    cmd: |
+      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("text", "main"))}
+`;
+  fs.writeFileSync(swapConfigPath, cfg);
+}
+
+function stopSwap() {
+  if (llamaSwap) {
+    llamaSwap.kill();
+    llamaSwap = null;
+  }
+}
+
+async function startSwap() {
+  stopSwap();
+  const swap = findBin("llama-swap");
+  if (!swap || !findBin("llama-server")) throw new Error("llama.cpp runtime not found");
+  swapPort = await freePort();
+  writeSwapConfig();
+  llamaSwap = spawn(swap, ["--config", swapConfigPath, "--listen", `127.0.0.1:${swapPort}`], {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  llamaSwap.stdout.on("data", (d) => process.stdout.write(`[swap] ${d}`));
+  llamaSwap.stderr.on("data", (d) => process.stderr.write(`[swap] ${d}`));
+  llamaSwap.on("exit", (code) => console.log(`[swap] exited ${code}`));
+  // /v1/models responds as soon as the proxy is up (no model loaded yet).
+  const ok = await waitForUrl(`http://127.0.0.1:${swapPort}/v1/models`);
+  if (!ok) throw new Error("llama-swap failed to start");
 }
 
 // ---------------------------------------------------------------------------
@@ -71,6 +263,20 @@ async function waitForHealth(port, timeoutMs = 60000) {
   return false;
 }
 
+async function waitForUrl(url, timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const res = await fetch(url);
+      if (res.ok) return true;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  return false;
+}
+
 function stopSidecar() {
   if (sidecar) {
     sidecar.kill();
@@ -80,15 +286,16 @@ function stopSidecar() {
 
 async function startSidecar() {
   stopSidecar();
+  const engine = loadEngine();
+  if (!engine) return 0; // nothing to run until the user picks an engine
   sidecarPort = await freePort();
   const env = {
     ...process.env,
     KHORA_PHOTO_DATA_DIR: dataDir,
     PHOTO_SIDECAR_PORT: String(sidecarPort),
     PYTHONUNBUFFERED: "1",
+    ...engineEnv(engine),
   };
-  const key = loadKey();
-  if (key) env.OPENAI_API_KEY = key;
 
   sidecar = spawn(
     PY,
@@ -104,18 +311,50 @@ async function startSidecar() {
   return sidecarPort;
 }
 
+// Bring up the full local stack: llama-swap (model server) then the sidecar.
+async function startServers() {
+  if (!loadEngine()) return; // nothing to run until the user sets up
+  await startSwap();
+  await startSidecar();
+}
+
 // ---------------------------------------------------------------------------
 // IPC
 // ---------------------------------------------------------------------------
-ipcMain.handle("get-config", async () => ({
-  baseUrl: `http://127.0.0.1:${sidecarPort}`,
-  hasKey: Boolean(loadKey()),
-}));
+async function engineStatus() {
+  const engine = loadEngine();
+  return {
+    configured: Boolean(engine),
+    baseUrl: sidecarPort ? `http://127.0.0.1:${sidecarPort}` : "",
+    ready: Boolean(engine) && sidecarPort > 0,
+    runtime: { available: runtimeAvailable(), modelsReady: modelsPresent() },
+    hardware: hardwareTier(),
+  };
+}
 
-ipcMain.handle("save-key", async (_e, key) => {
-  saveKey((key || "").trim());
-  await startSidecar(); // relaunch so the sidecar picks up the new key
-  return { ok: true, baseUrl: `http://127.0.0.1:${sidecarPort}`, hasKey: Boolean(loadKey()) };
+ipcMain.handle("get-config", async () => engineStatus());
+ipcMain.handle("engine-status", async () => engineStatus());
+
+// Set up the local engine and bring the stack up on it.
+ipcMain.handle("engine-set", async () => {
+  saveEngine({ ...LOCAL_ENGINE });
+  try {
+    await startServers();
+  } catch (err) {
+    return { ok: false, error: String(err.message || err), ...(await engineStatus()) };
+  }
+  return { ok: true, ...(await engineStatus()) };
+});
+
+// Download the model GGUFs from HuggingFace, forwarding progress to the renderer.
+ipcMain.handle("download-models", async (e) => {
+  const send = (p) => e.sender.send("model-download-progress", p);
+  try {
+    await downloadModels(send);
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: String(err.message || err) };
+  }
 });
 
 ipcMain.handle("pick-paths", async () => {
@@ -138,7 +377,7 @@ function createWindow() {
     width: 1280,
     height: 860,
     title: "Ash",
-    backgroundColor: "#0f1115",
+    backgroundColor: "#000000",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
@@ -146,17 +385,27 @@ function createWindow() {
     },
   });
   mainWindow.loadFile(path.join(ROOT, "renderer", "index.html"));
+
+  // Open target="_blank" links (the ↗ source links) in the system browser,
+  // not a new Electron window.
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
 }
 
 app.whenReady().then(async () => {
-  dataDir = path.join(app.getPath("userData"), "khora-data");
+  const userData = app.getPath("userData");
+  dataDir = path.join(userData, "khora-data");
+  modelsDir = path.join(userData, "models");
+  swapConfigPath = path.join(userData, "llama-swap.yaml");
+  settingsPath = path.join(userData, "settings.json");
   fs.mkdirSync(dataDir, { recursive: true });
-  settingsPath = path.join(app.getPath("userData"), "settings.json");
 
   try {
-    await startSidecar();
+    await startServers(); // no-op until an engine is configured
   } catch (err) {
-    console.error("sidecar startup failed:", err);
+    console.error("startup failed:", err);
   }
   createWindow();
 
@@ -165,5 +414,8 @@ app.whenReady().then(async () => {
   });
 });
 
-app.on("before-quit", stopSidecar);
+app.on("before-quit", () => {
+  stopSidecar();
+  stopSwap();
+});
 app.on("window-all-closed", () => app.quit());

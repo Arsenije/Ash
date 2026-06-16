@@ -31,6 +31,19 @@ _SYSTEM = (
     "Output ONLY the JSON object."
 )
 
+def _as_list(v: Any) -> list[str]:
+    """Coerce an array field to a clean list. Small models sometimes return a
+    comma-joined string instead of a JSON array — split it, rather than letting
+    a downstream ``for x in <string>`` iterate it character by character."""
+    if isinstance(v, str):
+        parts = v.split(",")
+    elif isinstance(v, list):
+        parts = v
+    else:
+        return []
+    return [str(x).strip() for x in parts if str(x).strip()]
+
+
 _client: AsyncOpenAI | None = None
 
 
@@ -72,9 +85,9 @@ async def describe_image(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     data = {
         "description": str(obj.get("description", "")).strip(),
         "location": str(obj.get("location", "")).strip(),
-        "objects": [str(x).strip() for x in obj.get("objects", []) if str(x).strip()],
-        "animals": [str(x).strip() for x in obj.get("animals", []) if str(x).strip()],
+        "objects": _as_list(obj.get("objects")),
+        "animals": _as_list(obj.get("animals")),
         "scene": str(obj.get("scene", "")).strip(),
-        "tags": [str(x).strip().lower() for x in obj.get("tags", []) if str(x).strip()],
+        "tags": [t.lower() for t in _as_list(obj.get("tags"))],
     }
     return data, usage
