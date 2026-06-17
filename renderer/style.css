@@ -70,8 +70,11 @@ a { color: var(--fg); }
 .groupby { display: inline-flex; align-items: center; gap: 8px; white-space: nowrap; }
 .groupby label { font-size: 14px; opacity: .55; }
 .groupby select {
-  background: var(--bg); color: var(--fg); border: 1px solid var(--fg);
-  padding: 7px 10px; font: inherit; font-size: 15px; cursor: pointer;
+  -webkit-appearance: none; appearance: none;
+  color: var(--fg); border: 1px solid var(--fg);
+  padding: 7px 32px 7px 12px; font: inherit; font-size: 15px; cursor: pointer;
+  /* custom chevron with controlled spacing so it can't clash with the border */
+  background: var(--bg) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E") no-repeat right 11px center;
 }
 
 /* info / about dialog */
