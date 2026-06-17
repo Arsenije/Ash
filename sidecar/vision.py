@@ -13,6 +13,7 @@ import base64
 import json
 import mimetypes
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +32,61 @@ _SYSTEM = (
     "Output ONLY the JSON object."
 )
 
+def _as_list(v: Any) -> list[str]:
+    """Coerce an array field to a clean list. Small models sometimes return a
+    comma-joined string instead of a JSON array — split it, rather than letting
+    a downstream ``for x in <string>`` iterate it character by character."""
+    if isinstance(v, str):
+        parts = v.split(",")
+    elif isinstance(v, list):
+        parts = v
+    else:
+        return []
+    return [str(x).strip() for x in parts if str(x).strip()]
+
+
+# A JSON schema (not just json_object): llama.cpp turns this into a grammar and
+# *constrains* generation to valid, complete JSON. Plain json_object isn't
+# grammar-enforced, so small vision models otherwise emit malformed or runaway
+# output that fails json.loads and the photo fails to scan.
+_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "description": {"type": "string"},
+        "location": {"type": "string"},
+        "objects": {"type": "array", "items": {"type": "string"}},
+        "animals": {"type": "array", "items": {"type": "string"}},
+        "scene": {"type": "string"},
+        "tags": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["description", "location", "objects", "animals", "scene", "tags"],
+}
+_RESPONSE_FORMAT = {"type": "json_schema", "json_schema": {"name": "photo", "schema": _SCHEMA}}
+
+
+def _loads(content: str) -> dict[str, Any]:
+    """Parse the model's JSON, tolerating a stray ```fence``` or surrounding prose."""
+    text = (content or "").strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[-1].removesuffix("```").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        i, j = text.find("{"), text.rfind("}")
+        if i >= 0 and j > i:
+            try:
+                return json.loads(text[i : j + 1])
+            except json.JSONDecodeError:
+                pass
+        # Runaway/truncated output (model looped past max_tokens): salvage the
+        # description so the photo still scans instead of failing outright.
+        m = re.search(r'"description"\s*:\s*"(.*?)(?:"\s*[,}]|$)', text, re.DOTALL)
+        if m:
+            return {"description": m.group(1).strip()[:600]}
+        raise
+
+
 _client: AsyncOpenAI | None = None
 
 
@@ -47,7 +103,10 @@ async def describe_image(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     b64 = base64.b64encode(path.read_bytes()).decode()
     resp = await _get_client().chat.completions.create(
         model=VISION_MODEL,
-        response_format={"type": "json_object"},
+        response_format=_RESPONSE_FORMAT,
+        max_tokens=700,  # cap runaway generation on small models
+        temperature=0.2,  # low temp + repeat penalty curb degenerate loops
+        extra_body={"repeat_penalty": 1.3},
         messages=[
             {"role": "system", "content": _SYSTEM},
             {
@@ -62,7 +121,7 @@ async def describe_image(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
             },
         ],
     )
-    obj = json.loads(resp.choices[0].message.content or "{}")
+    obj = _loads(resp.choices[0].message.content or "{}")
     u = resp.usage
     usage = {
         "model": VISION_MODEL,
@@ -72,9 +131,9 @@ async def describe_image(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     data = {
         "description": str(obj.get("description", "")).strip(),
         "location": str(obj.get("location", "")).strip(),
-        "objects": [str(x).strip() for x in obj.get("objects", []) if str(x).strip()],
-        "animals": [str(x).strip() for x in obj.get("animals", []) if str(x).strip()],
+        "objects": _as_list(obj.get("objects")),
+        "animals": _as_list(obj.get("animals")),
         "scene": str(obj.get("scene", "")).strip(),
-        "tags": [str(x).strip().lower() for x in obj.get("tags", []) if str(x).strip()],
+        "tags": [t.lower() for t in _as_list(obj.get("tags"))],
     }
     return data, usage

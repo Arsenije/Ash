@@ -16,16 +16,22 @@
         </div>
         <div id="suggest" class="suggest hidden"></div>
       </div>
-      <nav class="tabs" role="group">
-        <button class="tab active" data-view="gallery">Gallery</button>
-        <button class="tab" data-view="themes">Themes</button>
-      </nav>
-      <span id="cost" class="cost" title="Estimated OpenAI spend for this library"></span>
-      <button id="settings-btn" class="icon-btn" title="Settings" aria-label="Settings">
+      <div class="groupby">
+        <label for="groupby-sel">Group by</label>
+        <select id="groupby-sel">
+          <option value="none">None</option>
+          <option value="theme">Theme</option>
+          <option value="location">Location</option>
+          <option value="scene">Scene</option>
+          <option value="date">Date</option>
+        </select>
+      </div>
+      <button id="info-btn" class="icon-btn" title="About Ash" aria-label="About Ash">
         <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
              stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <circle cx="12" cy="12" r="3"></circle>
-          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+          <circle cx="12" cy="12" r="9"></circle>
+          <path d="M12 11v5"></path>
+          <path d="M12 7.6h.01"></path>
         </svg>
       </button>
     </header>
@@ -54,17 +60,143 @@
       </div>
     </div>
 
-    <!-- Settings modal -->
-    <div id="settings" class="modal hidden">
+    <!-- Onboarding / engine picker (first run, and reopened from the gear) -->
+    <div id="onboarding" class="onb hidden">
+      <div class="onb-card">
+        <button class="onb-close hidden" data-onb-close aria-label="Close">✕</button>
+
+        <!-- Step 1 — how Ash works, in plain lines -->
+        <section class="onb-step" data-step="1">
+          <h1 class="onb-title">Ash</h1>
+          <div class="onb-cols">
+            <div>
+              <div class="onb-h">Yes</div>
+              <ul class="onb-list">
+                <li>Makes sense of your photo dump.</li>
+                <li>Reads each photo and links them by shared people, places, and objects.</li>
+                <li>Open source, local-first, private by default.</li>
+              </ul>
+            </div>
+            <div>
+              <div class="onb-h">No</div>
+              <ul class="onb-list">
+                <li>No copying, uploading, or altering your photos.</li>
+                <li>No account. No tracking. No analytics.</li>
+                <li>No internet needed, everything runs on your machine.</li>
+              </ul>
+            </div>
+          </div>
+          <div class="onb-actions">
+            <button class="btn onb-primary" id="onb-next">Set up the AI model</button>
+          </div>
+        </section>
+
+        <!-- Step 2 — download the local models -->
+        <section class="onb-step hidden" data-step="2">
+          <h2>Set up the AI model</h2>
+          <p class="onb-lead">Ash runs entirely on your machine — no account, no cost, fully offline. The engine and index ship with the app; only the models download, once.</p>
+
+          <div class="onb-h">Included · runs locally, nothing leaves your machine</div>
+          <ul class="onb-models onb-included">
+            <li>
+              <div class="onb-m-top"><span class="onb-m-name"><b>llama.cpp</b><a class="onb-ext" href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener" aria-label="llama.cpp on GitHub">↗</a></span></div>
+              <div class="onb-m-sub">Runs the models on your machine's GPU.</div>
+            </li>
+            <li>
+              <div class="onb-m-top"><span class="onb-m-name"><b>llama-swap</b><a class="onb-ext" href="https://github.com/mostlygeek/llama-swap" target="_blank" rel="noopener" aria-label="llama-swap on GitHub">↗</a></span></div>
+              <div class="onb-m-sub">Serves all three models behind one local endpoint.</div>
+            </li>
+            <li>
+              <div class="onb-m-top"><span class="onb-m-name"><b>khora</b><a class="onb-ext" href="https://github.com/DeytaHQ/khora" target="_blank" rel="noopener" aria-label="khora on GitHub">↗</a></span></div>
+              <div class="onb-m-sub">The on-device index and graph — stores descriptions and links your photos. SQLite + LanceDB, no server.</div>
+            </li>
+          </ul>
+
+          <div class="onb-h onb-h-gap">Downloads now · ~3.5 GB</div>
+          <ul class="onb-models">
+            <li>
+              <div class="onb-m-top"><span class="onb-m-name"><b>SmolVLM2 2.2B</b><a class="onb-ext" href="https://huggingface.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF" target="_blank" rel="noopener" aria-label="SmolVLM2 on Hugging Face">↗</a></span><span>~1.5 GB</span></div>
+              <div class="onb-m-sub">Vision model — looks at each photo and writes the description (includes the vision projector).</div>
+            </li>
+            <li>
+              <div class="onb-m-top"><span class="onb-m-name"><b>Nomic Embed</b><a class="onb-ext" href="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF" target="_blank" rel="noopener" aria-label="Nomic Embed on Hugging Face">↗</a></span><span>~80 MB</span></div>
+              <div class="onb-m-sub">Embeddings — turns descriptions into vectors so you can search by meaning.</div>
+            </li>
+            <li>
+              <div class="onb-m-top"><span class="onb-m-name"><b>Qwen2.5 3B</b><a class="onb-ext" href="https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF" target="_blank" rel="noopener" aria-label="Qwen2.5 3B on Hugging Face">↗</a></span><span>~1.9 GB</span></div>
+              <div class="onb-m-sub">Text model — pulls out places, objects, and scenes to link related photos.</div>
+            </li>
+          </ul>
+
+          <!-- shown when this machine will run these slowly (Intel / low RAM) -->
+          <div id="onb-warn" class="onb-warn hidden"></div>
+
+          <!-- normal: download button; swapped for an error notice if the local engine is missing -->
+          <div id="onb-engine-ready">
+            <button class="btn onb-primary" id="onb-download">Download models · ~3.5 GB, one time</button>
+            <p class="hint">Models you already have won't download again.</p>
+          </div>
+          <div id="onb-engine-missing" class="hidden">
+            <div class="onb-warn">The local engine isn't available on this machine. Reinstall Ash, or check the logs.</div>
+          </div>
+
+          <div id="onb-dl-status" class="onb-status"></div>
+        </section>
+      </div>
+    </div>
+
+    <!-- About / info -->
+    <div id="info" class="modal hidden">
       <div class="modal-card small">
         <button class="close" data-close>✕</button>
-        <h2>Settings</h2>
-        <label class="field">OpenAI API key
-          <input id="key-input" type="password" placeholder="sk-…" />
-        </label>
-        <p class="hint">Stored locally and encrypted. Used to describe photos and power search.</p>
-        <button id="key-save" class="btn">Save & restart engine</button>
-        <div id="key-status" class="hint"></div>
+        <h2>Ash <span id="info-version" class="info-version"></span></h2>
+        <div class="info-row">
+          <button id="info-update" class="btn small">Check for updates</button>
+          <span id="info-update-status" class="hint"></span>
+        </div>
+
+        <div class="onb-h info-h">What's new</div>
+        <ul class="onb-list">
+          <li>Runs entirely on your machine — local models via llama.cpp.</li>
+          <li>On-device entity extraction powers Themes and related photos.</li>
+          <li>Group your library by theme, location, scene, or date.</li>
+        </ul>
+
+        <div class="onb-h info-h">Models &amp; runtime</div>
+        <ul class="onb-models onb-included">
+          <li>
+            <div class="onb-m-top"><span class="onb-m-name"><b>llama.cpp</b><a class="onb-ext" href="https://github.com/ggml-org/llama.cpp" target="_blank" rel="noopener">↗</a></span></div>
+            <div class="onb-m-sub">Runs the models on your machine's GPU.</div>
+          </li>
+          <li>
+            <div class="onb-m-top"><span class="onb-m-name"><b>llama-swap</b><a class="onb-ext" href="https://github.com/mostlygeek/llama-swap" target="_blank" rel="noopener">↗</a></span></div>
+            <div class="onb-m-sub">Serves all three models behind one local endpoint.</div>
+          </li>
+          <li>
+            <div class="onb-m-top"><span class="onb-m-name"><b>khora</b><a class="onb-ext" href="https://github.com/DeytaHQ/khora" target="_blank" rel="noopener">↗</a></span></div>
+            <div class="onb-m-sub">The on-device index and graph — stores descriptions and links your photos. SQLite + LanceDB, no server.</div>
+          </li>
+          <li>
+            <div class="onb-m-top"><span class="onb-m-name"><b>SmolVLM2 2.2B</b><a class="onb-ext" href="https://huggingface.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF" target="_blank" rel="noopener">↗</a></span></div>
+            <div class="onb-m-sub">Vision model — looks at each photo and writes the description.</div>
+          </li>
+          <li>
+            <div class="onb-m-top"><span class="onb-m-name"><b>Nomic Embed</b><a class="onb-ext" href="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF" target="_blank" rel="noopener">↗</a></span></div>
+            <div class="onb-m-sub">Embeddings — turns descriptions into vectors so you can search by meaning.</div>
+          </li>
+          <li>
+            <div class="onb-m-top"><span class="onb-m-name"><b>Qwen2.5 3B</b><a class="onb-ext" href="https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF" target="_blank" rel="noopener">↗</a></span></div>
+            <div class="onb-m-sub">Text model — pulls out places, objects, and scenes to link related photos.</div>
+          </li>
+        </ul>
+
+        <div class="onb-h info-h">Rescan library</div>
+        <div class="info-row">
+          <button id="info-redescribe" class="btn small">Re-describe all</button>
+          <button id="info-reextract" class="btn small">Re-extract entities</button>
+        </div>
+        <p class="hint">Re-describe re-runs the vision model on every photo. Re-extract only rebuilds the connections from existing descriptions — faster, good after a model change.</p>
+        <div id="info-rescan-status" class="hint"></div>
       </div>
     </div>
 

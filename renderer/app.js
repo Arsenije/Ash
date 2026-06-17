@@ -12,8 +12,12 @@ const FIELDS = [
 
 const state = {
   baseUrl: "",
-  hasKey: false,
-  view: "gallery",
+  configured: false, // an engine has been chosen
+  ready: false, // sidecar is up and able to ingest/search
+  hardware: null,
+  runtime: null,
+  version: "",
+  groupBy: "none", // none (flat gallery) | theme | location | scene | date
   chips: [], // {field, value}
   pendingField: null,
   facets: {},
@@ -83,13 +87,14 @@ function refreshSoon() {
 }
 
 async function refresh() {
-  if (state.view === "themes") return renderThemes();
+  if (state.groupBy === "theme") return renderThemes();
   setStatus("Loading…");
   try {
     const data = hasAnyFilter()
       ? await getJSON("/search?" + currentParams().toString())
       : await getJSON("/gallery");
-    renderGrid(data.photos, data.mode);
+    if (state.groupBy === "none") renderGrid(data.photos, data.mode);
+    else renderGroups(data.photos, state.groupBy);
   } catch (err) {
     setStatus("Error: " + err.message);
   }
@@ -293,6 +298,23 @@ function renderGrid(photos, mode) {
   $("#themes").classList.add("hidden");
   grid.classList.remove("hidden");
   setStatus(`${photos.length} photo${photos.length === 1 ? "" : "s"}${mode ? " · " + mode : ""}`);
+
+  // Empty library, no active filter — show the front door instead of a blank grid.
+  if (!photos.length && !hasAnyFilter() && state.ready) {
+    setStatus("");
+    const empty = el("div", "empty");
+    const msg = el("div", "empty-msg");
+    msg.textContent = "No photos yet.";
+    const hint = el("div", "hint");
+    hint.textContent = "Drag photos or a folder here, or choose them.";
+    const btn = el("button", "btn");
+    btn.textContent = "Choose photos";
+    btn.onclick = pickAndIngest;
+    empty.append(msg, hint, btn);
+    grid.appendChild(empty);
+    return;
+  }
+
   for (const ph of photos) {
     const card = el("div", "card");
     if (ph.src === null) card.classList.add("missing");
@@ -326,41 +348,21 @@ async function loadFacets() {
   }
 }
 
-async function updateCost() {
-  try {
-    const u = await getJSON("/usage");
-    const c = u.cost_usd || 0;
-    const label = c > 0 && c < 0.01 ? "<$0.01" : "$" + c.toFixed(2);
-    const el2 = $("#cost");
-    el2.textContent = `~${label}`;
-    el2.title = `Estimated OpenAI spend for this library · ${u.photos} photos · ${(u.input_tokens + u.output_tokens).toLocaleString()} tokens`;
-  } catch {
-    $("#cost").textContent = "";
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Themes
 // ---------------------------------------------------------------------------
-async function renderThemes() {
+// Render [{label, count, photos}] as labelled photo strips in the #themes pane.
+function renderSections(sections, emptyMsg) {
   $("#grid").classList.add("hidden");
   const box = $("#themes");
   box.classList.remove("hidden");
   box.innerHTML = "";
-  setStatus("Loading themes…");
-  let data;
-  try {
-    data = await getJSON("/themes");
-  } catch (err) {
-    setStatus("Error: " + err.message);
+  if (!sections.length) {
+    setStatus(emptyMsg);
     return;
   }
-  if (!data.themes.length) {
-    setStatus("No themes yet — add more photos and they'll group automatically.");
-    return;
-  }
-  setStatus(`${data.themes.length} themes`);
-  for (const t of data.themes) {
+  setStatus(`${sections.length} group${sections.length === 1 ? "" : "s"}`);
+  for (const t of sections) {
     const section = el("div", "theme-section");
     const head = el("div", "theme-head");
     head.innerHTML = `<b></b><span></span>`;
@@ -379,6 +381,39 @@ async function renderThemes() {
     section.appendChild(strip);
     box.appendChild(section);
   }
+}
+
+// Group by → Theme: khora's resolved entity graph (category + recurring entities).
+async function renderThemes() {
+  setStatus("Loading themes…");
+  let data;
+  try {
+    data = await getJSON("/themes");
+  } catch (err) {
+    setStatus("Error: " + err.message);
+    return;
+  }
+  renderSections(data.themes, "No themes yet — add more photos and they'll group automatically.");
+}
+
+// Group by → Location / Scene / Date: client-side from the photo attributes.
+function renderGroups(photos, key) {
+  const labelFor = (ph) => {
+    if (key === "location") return ph.location || "No location";
+    if (key === "scene") return ph.scene || "No scene";
+    if (key === "date") return (ph.occurred_at || "").slice(0, 7) || "No date";
+    return "Other";
+  };
+  const groups = new Map();
+  for (const ph of photos) {
+    const k = labelFor(ph);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(ph);
+  }
+  const sections = [...groups.entries()].map(([label, ps]) => ({ label, count: ps.length, photos: ps }));
+  if (key === "date") sections.sort((a, b) => b.label.localeCompare(a.label)); // newest first
+  else sections.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  renderSections(sections, "No photos yet.");
 }
 
 // ---------------------------------------------------------------------------
@@ -430,8 +465,9 @@ async function openDetail(id) {
 // Ingest (drag-drop only)
 // ---------------------------------------------------------------------------
 function goToGallery() {
-  state.view = "gallery";
-  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.view === "gallery"));
+  state.groupBy = "none";
+  const sel = $("#groupby-sel");
+  if (sel) sel.value = "none";
 }
 
 const IMG_RE = /\.(jpe?g|png|webp|gif|bmp|tiff?)$/i;
@@ -481,9 +517,8 @@ async function ingestDrop(entries) {
     showToast("Couldn't read any photo paths from that drop.", { autohide: 5000 });
     return;
   }
-  if (!state.hasKey) {
-    showToast("Add an OpenAI key in Settings first (⚙).");
-    openSettings();
+  if (!state.ready) {
+    openEngine(state.configured ? 2 : 1);
     return;
   }
   goToGallery();
@@ -492,8 +527,9 @@ async function ingestDrop(entries) {
   grid.classList.remove("hidden");
 
   // Optimistic cards (the actual image via object URL) for dropped image files.
+  // Dialog-picked entries have no File object, so they sync from the server instead.
   const cards = {};
-  const imageEntries = entries.filter((e) => IMG_RE.test(e.path));
+  const imageEntries = entries.filter((e) => e.file && IMG_RE.test(e.path));
   for (const entry of imageEntries) {
     const card = makeOptimisticCard(entry);
     cards[entry.path] = card;
@@ -538,41 +574,183 @@ async function ingestDrop(entries) {
     if (st.skipped) bits.push(`${st.skipped} skipped`);
     if (st.failed) bits.push(`${st.failed} failed`);
     showToast(`Scanning — ${handled}/${st.total} (${bits.join(", ")})`, { progress: frac });
-    updateCost(); // live spend as photos land
 
     if (st.status === "done") {
       let msg = `Done — ${st.done} added`;
       if (st.skipped) msg += `, ${st.skipped} skipped`;
       if (st.failed) msg += `, ${st.failed} failed`;
       if (st.failed && st.errors && st.errors[0]) msg += ` · ${st.errors[0].error}`;
-      // Keep failures on screen (likely a bad/blocked key); auto-dismiss clean runs.
+      // Keep failures on screen; auto-dismiss clean runs.
       showToast(msg, { progress: 1, autohide: st.failed ? 0 : 4000 });
       break;
     }
   }
   await loadFacets();
-  await updateCost();
   // Folder drops expand into images we didn't show optimistically — sync from server.
   if (expandedBeyondOptimistic) await refresh();
 }
 
 // ---------------------------------------------------------------------------
-// Settings
+// Pick photos (empty-state button + a path into ingest without drag-drop)
 // ---------------------------------------------------------------------------
-function openSettings() {
-  $("#settings").classList.remove("hidden");
+async function pickAndIngest() {
+  if (!state.ready) return openEngine(state.configured ? 2 : 1);
+  const paths = await window.api.pickPaths();
+  if (!paths.length) return;
+  // No File objects from the dialog, so no optimistic thumbnails — server syncs.
+  ingestDrop(paths.map((p) => ({ path: p })));
 }
 
-async function saveKey() {
-  const key = $("#key-input").value.trim();
-  if (!key) return;
-  $("#key-status").textContent = "Saving & restarting engine…";
-  const res = await window.api.saveKey(key);
-  state.baseUrl = res.baseUrl;
-  state.hasKey = res.hasKey;
-  $("#key-status").textContent = "Saved.";
+// ---------------------------------------------------------------------------
+// Onboarding / engine picker
+// ---------------------------------------------------------------------------
+function openEngine(step) {
+  // Only allow closing once an engine already works.
+  $(".onb-close").classList.toggle("hidden", !state.ready);
+  gotoStep(step || 1);
+  $("#onboarding").classList.remove("hidden");
+}
+
+function closeEngine() {
+  $("#onboarding").classList.add("hidden");
+}
+
+function gotoStep(n) {
+  document.querySelectorAll(".onb-step").forEach((s) => s.classList.toggle("hidden", Number(s.dataset.step) !== n));
+  if (n === 2) {
+    $("#onb-dl-status").textContent = "";
+    renderEngineStep();
+  }
+}
+
+// Reflect this machine's hardware + whether the local engine is present.
+function renderEngineStep() {
+  const hw = state.hardware || {};
+  const warn = $("#onb-warn");
+  if (hw.tier === "slow") {
+    warn.textContent =
+      "This machine has an Intel chip, so the models run on the CPU — describing photos will be slow, often a minute or more each. Apple Silicon is much faster.";
+    warn.classList.remove("hidden");
+  } else if (hw.tier === "lowram") {
+    warn.textContent = `Ash works best with 8 GB of memory; this machine has ${hw.totalRamGB} GB. Ingest may be slow or stall.`;
+    warn.classList.remove("hidden");
+  } else {
+    warn.classList.add("hidden");
+  }
+  const haveRuntime = state.runtime && state.runtime.available;
+  $("#onb-engine-ready").classList.toggle("hidden", !haveRuntime);
+  $("#onb-engine-missing").classList.toggle("hidden", haveRuntime);
+}
+
+function applyStatus(res) {
+  state.configured = res.configured;
+  state.ready = res.ready;
+  state.hardware = res.hardware;
+  state.runtime = res.runtime;
+  if (res.version) state.version = res.version;
+  if (res.baseUrl) state.baseUrl = res.baseUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Info / About dialog
+// ---------------------------------------------------------------------------
+function openInfo() {
+  $("#info-version").textContent = state.version ? "v" + state.version : "";
+  $("#info-update-status").textContent = "";
+  $("#info-rescan-status").textContent = "";
+  $("#info").classList.remove("hidden");
+}
+
+async function checkUpdates() {
+  const s = $("#info-update-status");
+  s.textContent = "Checking…";
+  await sleep(500); // no release feed yet — stub
+  s.textContent = `You're on the latest version${state.version ? " (v" + state.version + ")" : ""}.`;
+}
+
+// Rescan the whole library: "describe" re-runs the vision model on every photo;
+// "extract" only rebuilds the entity graph from existing descriptions.
+async function runRescan(mode) {
+  if (!state.ready) return;
+  const label = mode === "describe" ? "Re-describing" : "Re-extracting";
+  const s = $("#info-rescan-status");
+  s.textContent = `${label} — starting…`;
+  let job;
+  try {
+    const res = await fetch(state.baseUrl + "/rescan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    job = await res.json();
+  } catch (err) {
+    s.textContent = "Couldn't start: " + err.message;
+    return;
+  }
+  $("#info").classList.add("hidden");
+  showToast(`${label} ${job.total} photo${job.total === 1 ? "" : "s"}…`, { progress: 0 });
+  while (true) {
+    await sleep(800);
+    let st;
+    try {
+      st = await getJSON("/ingest/status?job_id=" + job.job_id);
+    } catch {
+      break;
+    }
+    const handled = st.done + (st.skipped || 0) + st.failed;
+    showToast(`${label} — ${handled}/${st.total}`, { progress: st.total ? handled / st.total : 1 });
+    if (st.status === "done") {
+      let msg = `${label} done — ${st.done} updated`;
+      if (st.skipped) msg += `, ${st.skipped} skipped`;
+      if (st.failed) msg += `, ${st.failed} failed`;
+      showToast(msg, { progress: 1, autohide: st.failed ? 0 : 4000 });
+      break;
+    }
+  }
   await loadFacets();
   await refresh();
+}
+
+async function finishEngine(res, statusEl) {
+  if (!res.ok || !res.ready) {
+    if (statusEl) statusEl.textContent = "Couldn't start the engine. " + (res.error || "");
+    return;
+  }
+  applyStatus(res);
+  closeEngine();
+  showToast("Model ready. Add your first photos.", { progress: 1, autohide: 4000 });
+  await loadFacets();
+  await refresh();
+}
+
+// Recommended path: download the local models, then start on them.
+async function downloadLocal() {
+  const dl = $("#onb-download");
+  const status = $("#onb-dl-status");
+  dl.disabled = true;
+  status.textContent = "Starting download…";
+  const off = window.api.onModelProgress((p) => {
+    const pct = Math.round((p.fraction || 0) * 100);
+    status.textContent = `Downloading ${p.model} — ${pct}%`;
+    showToast(`Downloading ${p.model} — ${pct}%`, { progress: p.fraction || 0 });
+  });
+  let res;
+  try {
+    res = await window.api.downloadModels();
+  } finally {
+    off();
+  }
+  hideToast();
+  dl.disabled = false;
+  if (!res.ok) {
+    status.textContent = /installed|running|available/.test(res.error || "")
+      ? "The local engine isn't available. Reinstall Ash, or check the logs."
+      : "Download stopped. " + res.error;
+    return;
+  }
+  status.textContent = "Setting up…";
+  await finishEngine(await window.api.engineSet(), status);
 }
 
 // ---------------------------------------------------------------------------
@@ -614,20 +792,23 @@ function wire() {
     if (!e.target.closest(".searchwrap")) hideSuggest();
   });
 
-  document.querySelectorAll(".tab").forEach((b) => {
-    b.onclick = () => {
-      document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      state.view = b.dataset.view;
-      refresh();
-    };
-  });
+  $("#groupby-sel").onchange = (e) => {
+    state.groupBy = e.target.value;
+    refresh();
+  };
 
-  $("#settings-btn").onclick = openSettings;
-  $("#key-save").onclick = saveKey;
+  $("#info-btn").onclick = openInfo;
+  $("#info-update").onclick = checkUpdates;
+  $("#info-redescribe").onclick = () => runRescan("describe");
+  $("#info-reextract").onclick = () => runRescan("extract");
   document.querySelectorAll("[data-close]").forEach((b) => {
     b.onclick = () => b.closest(".modal").classList.add("hidden");
   });
+
+  // Onboarding / engine setup.
+  $("#onb-next").onclick = () => gotoStep(2);
+  $("#onb-download").onclick = downloadLocal;
+  $(".onb-close").onclick = closeEngine;
   document.querySelectorAll(".modal").forEach((m) => {
     m.onclick = (e) => {
       if (e.target === m) m.classList.add("hidden");
@@ -663,10 +844,13 @@ function wire() {
 async function init() {
   wire();
   const cfg = await window.api.getConfig();
-  state.baseUrl = cfg.baseUrl;
-  state.hasKey = cfg.hasKey;
+  applyStatus(cfg);
+  if (!state.ready) {
+    // First run (no engine) or engine configured but not up yet — onboard / repair.
+    openEngine(state.configured ? 2 : 1);
+    return;
+  }
   await loadFacets();
-  await updateCost();
   await refresh();
 }
 
