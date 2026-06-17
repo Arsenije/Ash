@@ -95,9 +95,3 @@ npm start                                               # run
 
 The app finds the runtime binaries in `vendor/bin/` (populated by `npm run binaries`), or in a packaged bundle's `Resources/bin/`.
 </details>
-
----
-
-## Status
-
-A working, local-only vertical slice built on khora's embedded stack. It's not yet packaged as a downloadable app — for now it runs from source (`npm start` plus a local Python venv, with the llama.cpp/llama-swap binaries installed separately). Bundling and signing those binaries into a distributable `.app` is the remaining packaging step.
