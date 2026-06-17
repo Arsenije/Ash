@@ -1,10 +1,14 @@
 {
   "name": "ash",
+  "productName": "Ash",
   "version": "0.1.0",
   "private": true,
-  "description": "Ash — local photo gallery: drag-drop photos, describe with OpenAI, search/filter via khora (embedded, offline).",
+  "description": "Ash — fully local photo gallery: drag-drop photos, described on-device by local models (llama.cpp), search/filter/connect via khora (embedded, offline).",
   "main": "electron/main.js",
   "scripts": {
+    "setup": "bash scripts/setup.sh",
+    "setup:win": "powershell -ExecutionPolicy Bypass -File scripts/setup.ps1",
+    "binaries": "node scripts/fetch-binaries.mjs",
     "start": "electron ."
   },
   "devDependencies": {

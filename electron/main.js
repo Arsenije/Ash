@@ -11,7 +11,11 @@ const fs = require("node:fs");
 
 const ROOT = path.join(__dirname, "..");
 const SIDECAR_DIR = path.join(ROOT, "sidecar");
-const PY = path.join(SIDECAR_DIR, ".venv", "bin", "python");
+const IS_WIN = process.platform === "win32";
+const PY = IS_WIN
+  ? path.join(SIDECAR_DIR, ".venv", "Scripts", "python.exe")
+  : path.join(SIDECAR_DIR, ".venv", "bin", "python");
+const ICON = path.join(ROOT, "assets", "icon.png"); // drop a 1024×1024 PNG here
 
 let mainWindow = null;
 let sidecar = null;
@@ -92,26 +96,31 @@ function engineEnv(engine) {
   };
 }
 
-// Coarse hardware tier for the onboarding warning. Apple Silicon runs these
-// models on the GPU (Metal); Intel is CPU-only and much slower.
+// Coarse hardware tier for the onboarding warning.
+//   macOS: Apple Silicon runs on the GPU (Metal); an Intel Mac is CPU-only (slow).
+//   Windows/Linux: we can't cheaply tell if there's a usable GPU, so we only
+//   warn on low memory (the "slow" Intel-Mac copy never fires off-Mac).
 function hardwareTier() {
-  const appleSilicon = (os.cpus()[0]?.model || "").includes("Apple");
   const totalRamGB = Math.round(os.totalmem() / 1e9);
-  let tier = "good";
-  if (!appleSilicon) tier = "slow";
-  else if (totalRamGB < 8) tier = "lowram";
-  return { appleSilicon, totalRamGB, tier };
+  if (process.platform === "darwin" && !(os.cpus()[0]?.model || "").includes("Apple")) {
+    return { tier: "slow", totalRamGB };
+  }
+  if (totalRamGB < 8) return { tier: "lowram", totalRamGB };
+  return { tier: "good", totalRamGB };
 }
 
 // ---------------------------------------------------------------------------
 // llama.cpp binaries — bundled in the app (Resources/bin), with dev fallbacks.
 // ---------------------------------------------------------------------------
 function findBin(name) {
+  const exe = IS_WIN ? `${name}.exe` : name;
   const candidates = [
-    process.resourcesPath && path.join(process.resourcesPath, "bin", name),
-    path.join(ROOT, "vendor", "bin", name),
-    `/opt/homebrew/bin/${name}`,
-    `/usr/local/bin/${name}`,
+    process.resourcesPath && path.join(process.resourcesPath, "bin", exe), // bundled
+    path.join(ROOT, "vendor", "bin", exe), // fetched by scripts/fetch-binaries
+    process.platform === "darwin" && `/opt/homebrew/bin/${exe}`,
+    process.platform === "darwin" && `/usr/local/bin/${exe}`,
+    process.platform === "linux" && `/usr/local/bin/${exe}`,
+    process.platform === "linux" && `/usr/bin/${exe}`,
   ].filter(Boolean);
   return candidates.find((p) => fs.existsSync(p)) || null;
 }
@@ -380,6 +389,7 @@ function createWindow() {
     width: 1280,
     height: 860,
     title: "Ash",
+    icon: fs.existsSync(ICON) ? ICON : undefined, // win/linux; macOS uses the dock/bundle icon
     backgroundColor: "#000000",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -404,6 +414,9 @@ app.whenReady().then(async () => {
   swapConfigPath = path.join(userData, "llama-swap.yaml");
   settingsPath = path.join(userData, "settings.json");
   fs.mkdirSync(dataDir, { recursive: true });
+
+  app.setAboutPanelOptions({ applicationName: "Ash", applicationVersion: app.getVersion() });
+  if (process.platform === "darwin" && app.dock && fs.existsSync(ICON)) app.dock.setIcon(ICON);
 
   try {
     await startServers(); // no-op until an engine is configured

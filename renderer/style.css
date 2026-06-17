@@ -19,7 +19,7 @@ a { color: var(--fg); }
 /* ------------------------------------------------------------------ top bar */
 .topbar {
   display: flex; align-items: stretch; gap: 12px;
-  padding: 10px 14px; border-bottom: 1px solid var(--fg);
+  padding: 10px 14px;
 }
 .searchwrap { position: relative; flex: 1; display: flex; }
 .searchbar {
@@ -79,6 +79,9 @@ a { color: var(--fg); }
 
 /* info / about dialog */
 .info-version { font-size: 14px; opacity: .55; font-weight: 400; }
+.info-repo { margin: 4px 0 0; font-size: 13px; opacity: .6; }
+.info-repo a { text-decoration: underline; }
+.info-repo:hover { opacity: 1; }
 .info-h { margin-top: 20px; }
 .info-row { display: flex; align-items: center; gap: 12px; margin: 10px 0; flex-wrap: wrap; }
 
