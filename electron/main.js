@@ -12,6 +12,7 @@ const fs = require("node:fs");
 const ROOT = path.join(__dirname, "..");
 const SIDECAR_DIR = path.join(ROOT, "sidecar");
 const PY = path.join(SIDECAR_DIR, ".venv", "bin", "python");
+const ICON = path.join(ROOT, "assets", "icon.png"); // drop a 1024×1024 PNG here
 
 let mainWindow = null;
 let sidecar = null;
@@ -380,6 +381,7 @@ function createWindow() {
     width: 1280,
     height: 860,
     title: "Ash",
+    icon: fs.existsSync(ICON) ? ICON : undefined, // win/linux; macOS uses the dock/bundle icon
     backgroundColor: "#000000",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),
@@ -404,6 +406,9 @@ app.whenReady().then(async () => {
   swapConfigPath = path.join(userData, "llama-swap.yaml");
   settingsPath = path.join(userData, "settings.json");
   fs.mkdirSync(dataDir, { recursive: true });
+
+  app.setAboutPanelOptions({ applicationName: "Ash", applicationVersion: app.getVersion() });
+  if (process.platform === "darwin" && app.dock && fs.existsSync(ICON)) app.dock.setIcon(ICON);
 
   try {
     await startServers(); // no-op until an engine is configured

@@ -1,5 +1,6 @@
 {
   "name": "ash",
+  "productName": "Ash",
   "version": "0.1.0",
   "private": true,
   "description": "Ash — fully local photo gallery: drag-drop photos, described on-device by local models (llama.cpp), search/filter/connect via khora (embedded, offline).",
