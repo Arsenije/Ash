@@ -1,5 +1,3 @@
-<div align="center">
-
 # Ash
 
 **Search your photos by what's actually in them — completely offline.**
