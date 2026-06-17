@@ -5,3 +5,4 @@ uvicorn[standard]
 openai
 pillow
 python-multipart
+reverse_geocoder

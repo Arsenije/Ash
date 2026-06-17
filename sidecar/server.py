@@ -15,6 +15,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import reverse_geocoder as rg
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -128,6 +130,44 @@ def _photo_datetime(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 
 
+def _photo_gps(path: Path) -> tuple[float, float] | None:
+    """Return (latitude, longitude) from EXIF GPS IFD, or None if absent."""
+    try:
+        exif = Image.open(path).getexif()
+        gps = exif.get_ifd(0x8825)  # GPS IFD
+        if not gps:
+            return None
+        lat_ref = gps.get(1)   # 'N' or 'S'
+        lat_dms = gps.get(2)   # (degrees, minutes, seconds)
+        lon_ref = gps.get(3)   # 'E' or 'W'
+        lon_dms = gps.get(4)
+        if not (lat_ref and lat_dms and lon_ref and lon_dms):
+            return None
+        def to_deg(dms, ref: str) -> float:
+            d, m, s = (float(x) for x in dms)
+            deg = d + m / 60 + s / 3600
+            return -deg if ref in ("S", "W") else deg
+        lat = to_deg(lat_dms, lat_ref)
+        lon = to_deg(lon_dms, lon_ref)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return lat, lon
+    except Exception:
+        return None
+
+
+def _reverse_geocode(lat: float, lon: float) -> dict[str, str]:
+    """Return {city, admin1, country} for coordinates using local GeoNames data."""
+    try:
+        results = rg.search((lat, lon), verbose=False)
+        if results:
+            r = results[0]
+            return {"gps_city": r.get("name", ""), "gps_admin1": r.get("admin1", ""), "gps_country": r.get("cc", "")}
+    except Exception:
+        pass
+    return {}
+
+
 def _make_thumbnail(path: Path, ext_id: str) -> None:
     out = kc.THUMBS_DIR / f"{ext_id}.webp"
     if out.exists():
@@ -160,6 +200,11 @@ def _photo_dto(doc: Any, *, description: str | None = None, score: float | None 
         "scene": c.get("scene") or None,
         "tags": c.get("tags", []),
         "occurred_at": c.get("occurred_at") or (st.isoformat() if st else None),
+        "gps_lat": c.get("gps_lat"),
+        "gps_lon": c.get("gps_lon"),
+        "gps_city": c.get("gps_city"),
+        "gps_admin1": c.get("gps_admin1"),
+        "gps_country": c.get("gps_country"),
         "score": score,
     }
 
@@ -256,6 +301,7 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                     job["items"][key] = {"status": "skipped", "ext_id": ext_id}
                     return
                 dt = _photo_datetime(path)
+                gps = _photo_gps(path)
                 desc, vusage = await describe_image(path)
                 _record_usage(vusage["model"], vusage["input"], vusage["output"])
                 await asyncio.to_thread(_make_thumbnail, path, ext_id)
@@ -276,6 +322,9 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                             "tags": desc["tags"],
                             "occurred_at": dt.isoformat(),
                             "filename": path.name,
+                            "gps_lat": gps[0] if gps else None,
+                            "gps_lon": gps[1] if gps else None,
+                            **({} if not gps else _reverse_geocode(gps[0], gps[1])),
                         }
                     },
                     entity_types=ENTITY_TYPES,
@@ -350,6 +399,7 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         return
                     ext_id = it["external_id"] or _hash_file(path)
                     dt = it["source_timestamp"] or _photo_datetime(path)
+                    gps = _photo_gps(path)
                     # Describe first; if it raises we keep the existing doc (no data loss).
                     desc, vusage = await describe_image(path)
                     _record_usage(vusage["model"], vusage["input"], vusage["output"])
@@ -372,6 +422,9 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                                 "tags": desc["tags"],
                                 "occurred_at": dt.isoformat() if hasattr(dt, "isoformat") else str(dt),
                                 "filename": path.name,
+                                "gps_lat": gps[0] if gps else None,
+                                "gps_lon": gps[1] if gps else None,
+                                **({} if not gps else _reverse_geocode(gps[0], gps[1])),
                             }
                         },
                         entity_types=ENTITY_TYPES,
