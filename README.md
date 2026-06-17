@@ -19,21 +19,20 @@ Electron (UI)  ⇄  Python sidecar (FastAPI)  ⇄  khora (embedded)  →  llama-
 
 ## Setup
 
-**Apple Silicon strongly recommended** — see [Hardware](#hardware). One command does everything:
+Runs on **macOS, Windows, and Linux**. Needs [Node](https://nodejs.org) 18+ (uv is installed automatically if missing). A GPU helps a lot — see [Hardware](#hardware). One command does everything:
 
 ```bash
-npm run setup
+npm run setup        # macOS / Linux
+npm run setup:win    # Windows (PowerShell)
 ```
 
-It checks for the base tools (**Homebrew**, **Node**, **uv**) and **offers to install any that are missing**, then installs the model runtime (`llama.cpp` + `llama-swap`), the Python 3.13 sidecar (`khora` + FastAPI), and the Electron dependencies, and launches the app. It's idempotent — re-running just starts Ash. After the first time, `npm start` is enough.
-
-> If you don't have Node yet, the very first run needs `bash scripts/setup.sh` (since `npm` isn't available until Node is installed); it'll take it from there.
+It downloads the model runtime (`llama.cpp` + `llama-swap`) for your OS, creates the Python 3.13 sidecar (`khora` + FastAPI), installs the Electron dependencies, and launches the app. Idempotent — re-running just starts Ash; after the first time, `npm start` is enough.
 
 <details>
 <summary>What the one command does (or run the steps by hand)</summary>
 
 ```bash
-brew install llama.cpp llama-swap                       # model runtime
+npm run binaries                                        # llama.cpp + llama-swap for this OS/arch
 cd sidecar && uv venv --python 3.13 .venv \             # python sidecar
   && uv pip install --python .venv/bin/python "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart && cd ..
 npm install                                             # electron deps
@@ -41,7 +40,7 @@ npm start                                               # run
 ```
 </details>
 
-The app finds the runtime binaries in its bundle (`Resources/bin/`) first, then falls back to `vendor/bin/` and Homebrew for development.
+The app finds the runtime binaries in `vendor/bin/` (populated by `npm run binaries`), or in a packaged bundle's `Resources/bin/`.
 
 On first launch Ash walks you through a short setup:
 
@@ -54,6 +53,7 @@ Then drag in some photos. The OpenAI SDK is used only as the HTTP client for the
 
 - **Apple Silicon (M1–M4):** runs on the GPU via Metal, zero config. A base 8 GB M1 handles the bundled models fine; 16 GB is comfortable.
 - **Intel Macs:** CPU-only here — describing a photo can take a minute or more. Usable for small libraries, slow for bulk imports.
+- **Windows / Linux:** the fetched builds are CPU by default — fine for small libraries; for speed, drop a CUDA/Vulkan `llama.cpp` build into `vendor/bin`.
 - **Memory:** 8 GB is the practical floor; under that, ingest may stall.
 
 ## Features
