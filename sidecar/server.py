@@ -302,11 +302,16 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                     return
                 dt = _photo_datetime(path)
                 gps = _photo_gps(path)
+                geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
                 desc, vusage = await describe_image(path)
                 _record_usage(vusage["model"], vusage["input"], vusage["output"])
                 await asyncio.to_thread(_make_thumbnail, path, ext_id)
+                place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country")]
+                place_suffix = ", ".join(p for p in place_parts if p)
+                base_content = desc["description"] or f"Photo: {path.name}"
+                content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
                 result = await kc.kb().remember(
-                    content=desc["description"] or f"Photo: {path.name}",
+                    content=content,
                     namespace=kc.namespace(),
                     title=path.name,
                     source_type="photo",
@@ -324,7 +329,7 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                             "filename": path.name,
                             "gps_lat": gps[0] if gps else None,
                             "gps_lon": gps[1] if gps else None,
-                            **({} if not gps else _reverse_geocode(gps[0], gps[1])),
+                            **geo,
                         }
                     },
                     entity_types=ENTITY_TYPES,
@@ -400,13 +405,18 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                     ext_id = it["external_id"] or _hash_file(path)
                     dt = it["source_timestamp"] or _photo_datetime(path)
                     gps = _photo_gps(path)
+                    geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
                     # Describe first; if it raises we keep the existing doc (no data loss).
                     desc, vusage = await describe_image(path)
                     _record_usage(vusage["model"], vusage["input"], vusage["output"])
                     await asyncio.to_thread(_make_thumbnail, path, ext_id)
+                    place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country")]
+                    place_suffix = ", ".join(p for p in place_parts if p)
+                    base_content = desc["description"] or f"Photo: {path.name}"
+                    content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
                     await kc.kb().forget(it["doc_id"], namespace=ns)
                     result = await kc.kb().remember(
-                        content=desc["description"] or f"Photo: {path.name}",
+                        content=content,
                         namespace=ns,
                         title=it["title"] or path.name,
                         source_type="photo",
@@ -424,7 +434,7 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                                 "filename": path.name,
                                 "gps_lat": gps[0] if gps else None,
                                 "gps_lon": gps[1] if gps else None,
-                                **({} if not gps else _reverse_geocode(gps[0], gps[1])),
+                                **geo,
                             }
                         },
                         entity_types=ENTITY_TYPES,
