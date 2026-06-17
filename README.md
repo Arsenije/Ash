@@ -19,26 +19,29 @@ Electron (UI)  ⇄  Python sidecar (FastAPI)  ⇄  khora (embedded)  →  llama-
 
 ## Setup
 
-Requires Python 3.13, Node 18+, and the **llama.cpp** + **llama-swap** binaries. **Apple Silicon strongly recommended** — see [Hardware](#hardware).
+**Apple Silicon strongly recommended** — see [Hardware](#hardware). One command does everything:
 
 ```bash
-# 1. Local runtime (dev: via Homebrew; a packaged build bundles these in the app)
-brew install llama.cpp llama-swap
-
-# 2. Sidecar deps (installs khora with the embedded extra + FastAPI/OpenAI SDK/Pillow)
-cd sidecar
-uv venv --python 3.13 .venv
-uv pip install --python .venv/bin/python "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart
-cd ..
-
-# 3. Electron deps
-npm install
-
-# 4. Run
-npm start
+npm run setup
 ```
 
-The app finds the binaries in its bundle (`Resources/bin/`) first, then falls back to `vendor/bin/` and Homebrew for development.
+It checks for the base tools (**Homebrew**, **Node**, **uv**) and **offers to install any that are missing**, then installs the model runtime (`llama.cpp` + `llama-swap`), the Python 3.13 sidecar (`khora` + FastAPI), and the Electron dependencies, and launches the app. It's idempotent — re-running just starts Ash. After the first time, `npm start` is enough.
+
+> If you don't have Node yet, the very first run needs `bash scripts/setup.sh` (since `npm` isn't available until Node is installed); it'll take it from there.
+
+<details>
+<summary>What the one command does (or run the steps by hand)</summary>
+
+```bash
+brew install llama.cpp llama-swap                       # model runtime
+cd sidecar && uv venv --python 3.13 .venv \             # python sidecar
+  && uv pip install --python .venv/bin/python "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart && cd ..
+npm install                                             # electron deps
+npm start                                               # run
+```
+</details>
+
+The app finds the runtime binaries in its bundle (`Resources/bin/`) first, then falls back to `vendor/bin/` and Homebrew for development.
 
 On first launch Ash walks you through a short setup:
 
