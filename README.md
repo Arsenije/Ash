@@ -4,6 +4,8 @@ A **local, offline-first photo gallery** that turns a folder of photos into a se
 
 Photos are **never copied or uploaded for storage** — they stay in their original location; only the description and a file path are stored.
 
+![Ash — semantic search ("cat") across a local photo library](assets/screenshot.jpg)
+
 ## How it works
 
 ```
