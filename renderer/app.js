@@ -16,7 +16,8 @@ const state = {
   ready: false, // sidecar is up and able to ingest/search
   hardware: null,
   runtime: null,
-  view: "gallery",
+  version: "",
+  groupBy: "none", // none (flat gallery) | theme | location | scene | date
   chips: [], // {field, value}
   pendingField: null,
   facets: {},
@@ -86,13 +87,14 @@ function refreshSoon() {
 }
 
 async function refresh() {
-  if (state.view === "themes") return renderThemes();
+  if (state.groupBy === "theme") return renderThemes();
   setStatus("Loading…");
   try {
     const data = hasAnyFilter()
       ? await getJSON("/search?" + currentParams().toString())
       : await getJSON("/gallery");
-    renderGrid(data.photos, data.mode);
+    if (state.groupBy === "none") renderGrid(data.photos, data.mode);
+    else renderGroups(data.photos, state.groupBy);
   } catch (err) {
     setStatus("Error: " + err.message);
   }
@@ -349,25 +351,18 @@ async function loadFacets() {
 // ---------------------------------------------------------------------------
 // Themes
 // ---------------------------------------------------------------------------
-async function renderThemes() {
+// Render [{label, count, photos}] as labelled photo strips in the #themes pane.
+function renderSections(sections, emptyMsg) {
   $("#grid").classList.add("hidden");
   const box = $("#themes");
   box.classList.remove("hidden");
   box.innerHTML = "";
-  setStatus("Loading themes…");
-  let data;
-  try {
-    data = await getJSON("/themes");
-  } catch (err) {
-    setStatus("Error: " + err.message);
+  if (!sections.length) {
+    setStatus(emptyMsg);
     return;
   }
-  if (!data.themes.length) {
-    setStatus("No themes yet — add more photos and they'll group automatically.");
-    return;
-  }
-  setStatus(`${data.themes.length} themes`);
-  for (const t of data.themes) {
+  setStatus(`${sections.length} group${sections.length === 1 ? "" : "s"}`);
+  for (const t of sections) {
     const section = el("div", "theme-section");
     const head = el("div", "theme-head");
     head.innerHTML = `<b></b><span></span>`;
@@ -386,6 +381,39 @@ async function renderThemes() {
     section.appendChild(strip);
     box.appendChild(section);
   }
+}
+
+// Group by → Theme: khora's resolved entity graph (category + recurring entities).
+async function renderThemes() {
+  setStatus("Loading themes…");
+  let data;
+  try {
+    data = await getJSON("/themes");
+  } catch (err) {
+    setStatus("Error: " + err.message);
+    return;
+  }
+  renderSections(data.themes, "No themes yet — add more photos and they'll group automatically.");
+}
+
+// Group by → Location / Scene / Date: client-side from the photo attributes.
+function renderGroups(photos, key) {
+  const labelFor = (ph) => {
+    if (key === "location") return ph.location || "No location";
+    if (key === "scene") return ph.scene || "No scene";
+    if (key === "date") return (ph.occurred_at || "").slice(0, 7) || "No date";
+    return "Other";
+  };
+  const groups = new Map();
+  for (const ph of photos) {
+    const k = labelFor(ph);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(ph);
+  }
+  const sections = [...groups.entries()].map(([label, ps]) => ({ label, count: ps.length, photos: ps }));
+  if (key === "date") sections.sort((a, b) => b.label.localeCompare(a.label)); // newest first
+  else sections.sort((a, b) => b.count - a.count || a.label.localeCompare(b.label));
+  renderSections(sections, "No photos yet.");
 }
 
 // ---------------------------------------------------------------------------
@@ -437,8 +465,9 @@ async function openDetail(id) {
 // Ingest (drag-drop only)
 // ---------------------------------------------------------------------------
 function goToGallery() {
-  state.view = "gallery";
-  document.querySelectorAll(".tab").forEach((b) => b.classList.toggle("active", b.dataset.view === "gallery"));
+  state.groupBy = "none";
+  const sel = $("#groupby-sel");
+  if (sel) sel.value = "none";
 }
 
 const IMG_RE = /\.(jpe?g|png|webp|gif|bmp|tiff?)$/i;
@@ -618,7 +647,69 @@ function applyStatus(res) {
   state.ready = res.ready;
   state.hardware = res.hardware;
   state.runtime = res.runtime;
+  if (res.version) state.version = res.version;
   if (res.baseUrl) state.baseUrl = res.baseUrl;
+}
+
+// ---------------------------------------------------------------------------
+// Info / About dialog
+// ---------------------------------------------------------------------------
+function openInfo() {
+  $("#info-version").textContent = state.version ? "v" + state.version : "";
+  $("#info-update-status").textContent = "";
+  $("#info-rescan-status").textContent = "";
+  $("#info").classList.remove("hidden");
+}
+
+async function checkUpdates() {
+  const s = $("#info-update-status");
+  s.textContent = "Checking…";
+  await sleep(500); // no release feed yet — stub
+  s.textContent = `You're on the latest version${state.version ? " (v" + state.version + ")" : ""}.`;
+}
+
+// Rescan the whole library: "describe" re-runs the vision model on every photo;
+// "extract" only rebuilds the entity graph from existing descriptions.
+async function runRescan(mode) {
+  if (!state.ready) return;
+  const label = mode === "describe" ? "Re-describing" : "Re-extracting";
+  const s = $("#info-rescan-status");
+  s.textContent = `${label} — starting…`;
+  let job;
+  try {
+    const res = await fetch(state.baseUrl + "/rescan", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ mode }),
+    });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    job = await res.json();
+  } catch (err) {
+    s.textContent = "Couldn't start: " + err.message;
+    return;
+  }
+  $("#info").classList.add("hidden");
+  showToast(`${label} ${job.total} photo${job.total === 1 ? "" : "s"}…`, { progress: 0 });
+  while (true) {
+    await sleep(800);
+    let st;
+    try {
+      st = await getJSON("/ingest/status?job_id=" + job.job_id);
+    } catch {
+      break;
+    }
+    const handled = st.done + (st.skipped || 0) + st.failed;
+    showToast(`${label} — ${handled}/${st.total}`, { progress: st.total ? handled / st.total : 1 });
+    if (st.status === "done") {
+      let msg = `${label} done — ${st.done} updated`;
+      if (st.skipped) msg += `, ${st.skipped} skipped`;
+      if (st.failed) msg += `, ${st.failed} failed`;
+      showToast(msg, { progress: 1, autohide: st.failed ? 0 : 4000 });
+      break;
+    }
+  }
+  await loadFacets();
+  await refresh();
 }
 
 async function finishEngine(res, statusEl) {
@@ -701,16 +792,15 @@ function wire() {
     if (!e.target.closest(".searchwrap")) hideSuggest();
   });
 
-  document.querySelectorAll(".tab").forEach((b) => {
-    b.onclick = () => {
-      document.querySelectorAll(".tab").forEach((x) => x.classList.remove("active"));
-      b.classList.add("active");
-      state.view = b.dataset.view;
-      refresh();
-    };
-  });
+  $("#groupby-sel").onchange = (e) => {
+    state.groupBy = e.target.value;
+    refresh();
+  };
 
-  $("#settings-btn").onclick = () => openEngine(state.configured ? 2 : 1);
+  $("#info-btn").onclick = openInfo;
+  $("#info-update").onclick = checkUpdates;
+  $("#info-redescribe").onclick = () => runRescan("describe");
+  $("#info-reextract").onclick = () => runRescan("extract");
   document.querySelectorAll("[data-close]").forEach((b) => {
     b.onclick = () => b.closest(".modal").classList.add("hidden");
   });

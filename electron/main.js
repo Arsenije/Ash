@@ -36,7 +36,9 @@ let settingsPath = "";
 const MODELS = {
   vision: { label: "SmolVLM2 2.2B", repo: "ggml-org/SmolVLM2-2.2B-Instruct-GGUF", quant: "Q4_K_M", mmproj: true },
   embed: { label: "Nomic Embed", repo: "nomic-ai/nomic-embed-text-v1.5-GGUF", quant: "Q4_K_M" },
-  text: { label: "Llama 3.2 1B", repo: "bartowski/Llama-3.2-1B-Instruct-GGUF", quant: "Q4_K_M" },
+  // Qwen2.5-3B (not a 1B) — entity extraction needs a model that emits a single
+  // clean JSON object; 1B models wrap it in prose/fences and khora drops it.
+  text: { label: "Qwen2.5 3B", repo: "bartowski/Qwen2.5-3B-Instruct-GGUF", quant: "Q4_K_M" },
 };
 
 // The engine record persisted to settings. base_url is resolved at runtime from
@@ -205,7 +207,7 @@ function writeSwapConfig() {
   text:
     ttl: 300
     cmd: |
-      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("text", "main"))}
+      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("text", "main"))}
 `;
   fs.writeFileSync(swapConfigPath, cfg);
 }
@@ -329,6 +331,7 @@ async function engineStatus() {
     ready: Boolean(engine) && sidecarPort > 0,
     runtime: { available: runtimeAvailable(), modelsReady: modelsPresent() },
     hardware: hardwareTier(),
+    version: app.getVersion(),
   };
 }
 

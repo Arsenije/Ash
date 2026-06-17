@@ -304,6 +304,108 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Rescan — re-run the models over the existing library (e.g. after a model swap).
+#   describe: re-run the vision model on every photo, then re-extract.
+#   extract:  re-run only entity extraction over the stored descriptions.
+# ---------------------------------------------------------------------------
+class RescanRequest(BaseModel):
+    mode: str = "describe"
+
+
+@app.post("/rescan")
+async def rescan(req: RescanRequest) -> dict[str, Any]:
+    mode = req.mode if req.mode in ("describe", "extract") else "describe"
+    docs = await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)
+    items = [
+        {
+            "doc_id": d.id,
+            "external_id": getattr(d, "external_id", None),
+            "title": getattr(d, "title", None),
+            "source_url": getattr(d, "source_url", None),
+            "source_timestamp": getattr(d, "source_timestamp", None),
+            "content": getattr(d, "content", "") or "",
+            "metadata": getattr(d, "metadata", None) or {},
+        }
+        for d in docs
+    ]
+    job_id = uuid.uuid4().hex
+    _jobs[job_id] = {"total": len(items), "done": 0, "skipped": 0, "failed": 0, "status": "running", "errors": []}
+    asyncio.create_task(_run_rescan(job_id, items, mode))
+    return {"job_id": job_id, "total": len(items), "mode": mode}
+
+
+async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> None:
+    job = _jobs[job_id]
+    ns = kc.namespace()
+    sem = asyncio.Semaphore(INGEST_CONCURRENCY)
+
+    async def one(it: dict[str, Any]) -> None:
+        async with sem:
+            try:
+                if mode == "describe":
+                    src = it["source_url"]
+                    path = Path(src) if src else None
+                    if path is None or not path.exists():
+                        job["skipped"] += 1  # original file gone — leave the doc as-is
+                        return
+                    ext_id = it["external_id"] or _hash_file(path)
+                    dt = it["source_timestamp"] or _photo_datetime(path)
+                    # Describe first; if it raises we keep the existing doc (no data loss).
+                    desc, vusage = await describe_image(path)
+                    _record_usage(vusage["model"], vusage["input"], vusage["output"])
+                    await asyncio.to_thread(_make_thumbnail, path, ext_id)
+                    await kc.kb().forget(it["doc_id"], namespace=ns)
+                    result = await kc.kb().remember(
+                        content=desc["description"] or f"Photo: {path.name}",
+                        namespace=ns,
+                        title=it["title"] or path.name,
+                        source_type="photo",
+                        source_url=str(path.resolve()),
+                        source_timestamp=dt,
+                        external_id=ext_id,
+                        metadata={
+                            "custom": {
+                                "location": desc["location"],
+                                "objects": desc["objects"],
+                                "animals": desc["animals"],
+                                "scene": desc["scene"],
+                                "tags": desc["tags"],
+                                "occurred_at": dt.isoformat() if hasattr(dt, "isoformat") else str(dt),
+                                "filename": path.name,
+                            }
+                        },
+                        entity_types=ENTITY_TYPES,
+                        relationship_types=RELATIONSHIP_TYPES,
+                        expertise=PHOTO_EXPERTISE,
+                    )
+                else:  # extract: rebuild the entity graph from the stored description
+                    await kc.kb().forget(it["doc_id"], namespace=ns)
+                    result = await kc.kb().remember(
+                        content=it["content"] or f"Photo: {it['title'] or ''}",
+                        namespace=ns,
+                        title=it["title"],
+                        source_type="photo",
+                        source_url=it["source_url"],
+                        source_timestamp=it["source_timestamp"],
+                        external_id=it["external_id"],
+                        metadata=it["metadata"],
+                        entity_types=ENTITY_TYPES,
+                        relationship_types=RELATIONSHIP_TYPES,
+                        expertise=PHOTO_EXPERTISE,
+                    )
+                for u in result.llm_usage:
+                    _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
+                _persist_usage()
+                job["done"] += 1
+            except Exception as exc:
+                job["failed"] += 1
+                job["errors"].append({"doc_id": str(it["doc_id"]), "error": f"{type(exc).__name__}: {exc}"})
+
+    await asyncio.gather(*(one(it) for it in items))
+    job["status"] = "done"
+
+
+# ---------------------------------------------------------------------------
 # Query
 # ---------------------------------------------------------------------------
 def _build_filter(

@@ -6,7 +6,7 @@ out/
 *.log
 
 # Python sidecar
-sidecar/.venv/
+sidecar/.venv
 __pycache__/
 *.pyc
 
@@ -25,3 +25,6 @@ usage.json
 
 # OS
 .DS_Store
+
+# Bundled/dev binaries
+vendor/

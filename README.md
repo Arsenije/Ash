@@ -43,7 +43,7 @@ The app finds the binaries in its bundle (`Resources/bin/`) first, then falls ba
 On first launch Ash walks you through a short setup:
 
 1. **Yes / No** — what Ash does and doesn't do: photos stay on your machine, no account, no tracking, no network.
-2. **Set up the AI model** — Ash downloads three GGUF models from HuggingFace (~2.5 GB, once): SmolVLM2 2.2B (vision, + its mmproj projector), Nomic Embed v1.5 (embeddings), and Llama 3.2 1B (entity extraction). On Intel or low-memory machines you'll get a heads-up first that it'll be slow.
+2. **Set up the AI model** — Ash downloads three GGUF models from HuggingFace (~3.5 GB, once): SmolVLM2 2.2B (vision, + its mmproj projector), Nomic Embed v1.5 (embeddings), and Qwen2.5 3B (entity extraction). On Intel or low-memory machines you'll get a heads-up first that it'll be slow.
 
 Then drag in some photos. The OpenAI SDK is used only as the HTTP client for the local `llama-swap` endpoint — no key, no account.
 
