@@ -12,6 +12,7 @@ import hmac
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,15 @@ THUMB_SIZE = (512, 512)
 # the limit (default). Tune per embedding model; see /search.
 MIN_SIMILARITY = float(os.environ.get("PHOTO_MIN_SIMILARITY", "0") or 0)
 
-app = FastAPI(title="photo-gallery sidecar")
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    await kc.startup()
+    _load_usage()
+    yield
+    await kc.shutdown()
+
+
+app = FastAPI(title="photo-gallery sidecar", lifespan=_lifespan)
 
 # Per-session shared secret, minted by the Electron main process and handed to
 # both this sidecar (env) and the renderer (IPC). Every request must present it.
@@ -96,7 +105,8 @@ _usage: dict[str, Any] = {"by_model": {}, "photos": 0}
 def _load_usage() -> None:
     global _usage
     try:
-        _usage = json.loads(_USAGE_FILE.read_text())
+        loaded = json.loads(_USAGE_FILE.read_text())
+        _usage = loaded if isinstance(loaded, dict) else {}  # tolerate a corrupt/non-dict file
     except Exception:
         _usage = {}
     _usage.setdefault("by_model", {})
@@ -129,17 +139,6 @@ def _estimated_cost() -> float:
         in_rate, out_rate = _price_for(model)
         total += tok["input"] / 1_000_000 * in_rate + tok["output"] / 1_000_000 * out_rate
     return total
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    await kc.startup()
-    _load_usage()
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    await kc.shutdown()
 
 
 # ---------------------------------------------------------------------------
