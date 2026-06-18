@@ -20,6 +20,8 @@ const state = {
   hardware: null,
   runtime: null,
   version: "",
+  models: [], // selectable model catalog from main: [{id,label,size,blurb}]
+  selectedModel: "", // chosen model id
   groupBy: "none", // none (flat gallery) | theme | location | scene | date
   chips: [], // {field, value}
   pendingField: null,
@@ -675,6 +677,42 @@ function renderEngineStep() {
   const haveRuntime = state.runtime && state.runtime.available;
   $("#onb-engine-ready").classList.toggle("hidden", !haveRuntime);
   $("#onb-engine-missing").classList.toggle("hidden", haveRuntime);
+  renderModelChoices();
+}
+
+// Selectable model cards in onboarding; clicking one sets state.selectedModel.
+function renderModelChoices() {
+  const box = $("#onb-model-choices");
+  if (!box) return;
+  const choices = state.models || [];
+  if (!state.selectedModel && choices.length) state.selectedModel = choices[0].id;
+  box.innerHTML = "";
+  for (const c of choices) {
+    const card = el("div", "onb-choice");
+    card.classList.toggle("active", c.id === state.selectedModel);
+    const top = el("div", "onb-choice-top");
+    const name = el("b");
+    name.textContent = c.label;
+    const size = el("span", "onb-choice-size");
+    size.textContent = c.size || "";
+    top.append(name, size);
+    const blurb = el("div", "onb-choice-blurb");
+    blurb.textContent = c.blurb || "";
+    card.append(top, blurb);
+    card.onclick = () => {
+      state.selectedModel = c.id;
+      renderModelChoices();
+      updateDownloadLabel();
+    };
+    box.appendChild(card);
+  }
+  updateDownloadLabel();
+}
+
+function updateDownloadLabel() {
+  const dl = $("#onb-download");
+  const c = (state.models || []).find((m) => m.id === state.selectedModel);
+  if (dl && c) dl.textContent = `Download ${c.label}${c.size ? " · " + c.size : ""}`;
 }
 
 function applyStatus(res) {
@@ -685,6 +723,8 @@ function applyStatus(res) {
   if (res.version) state.version = res.version;
   if (res.baseUrl) state.baseUrl = res.baseUrl;
   if (res.token) state.token = res.token;
+  if (res.models) state.models = res.models;
+  if (res.selectedModel && !state.selectedModel) state.selectedModel = res.selectedModel;
 }
 
 // ---------------------------------------------------------------------------
@@ -773,7 +813,7 @@ async function downloadLocal() {
   });
   let res;
   try {
-    res = await window.api.downloadModels();
+    res = await window.api.downloadModels(state.selectedModel);
   } finally {
     off();
   }
@@ -786,7 +826,7 @@ async function downloadLocal() {
     return;
   }
   status.textContent = "Setting up…";
-  await finishEngine(await window.api.engineSet(), status);
+  await finishEngine(await window.api.engineSet(state.selectedModel), status);
 }
 
 // ---------------------------------------------------------------------------
