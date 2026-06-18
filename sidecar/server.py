@@ -30,9 +30,14 @@ from vision import describe_image
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
 INGEST_CONCURRENCY = 4
 THUMB_SIZE = (512, 512)
-# Relevance floor for semantic search (raw cosine). 0 = return everything up to
-# the limit (default). Tune per embedding model; see /search.
-MIN_SIMILARITY = float(os.environ.get("PHOTO_MIN_SIMILARITY", "0") or 0)
+# Relevance floor for semantic search (raw cosine, applied before khora
+# normalizes scores into a [0,1] rank). 0 disables it. Default 0.5 is
+# calibrated for the bundled nomic-embed-text-v1.5 model: on a real ingest it
+# kept loose-but-valid matches ("pet" -> the cat, "seaside" -> the beach) while
+# dropping nonsense queries and unrelated images (0.3 was a no-op — nomic's
+# baseline cosine is high; 0.6 started cutting valid fuzzy matches). Override
+# via PHOTO_MIN_SIMILARITY for other embedding models.
+MIN_SIMILARITY = float(os.environ.get("PHOTO_MIN_SIMILARITY", "0.5") or 0)
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -528,10 +533,9 @@ async def search(
 
     if q:
         flt = _build_filter(location, scene, objects, tags, date_from, date_to)
-        # Optional relevance floor (raw cosine, applied before khora normalizes
-        # the returned scores to a [0,1] rank). Off by default — the right value
-        # depends on the embedding model, so it's opt-in via PHOTO_MIN_SIMILARITY
-        # rather than a guessed default that might drop good matches.
+        # Relevance floor (MIN_SIMILARITY) keeps the result set to photos that
+        # actually relate to the query instead of returning the whole library
+        # ranked. Passed only when >0 so a 0 override restores "return all".
         recall_kwargs: dict[str, Any] = {}
         if MIN_SIMILARITY > 0:
             recall_kwargs["min_similarity"] = MIN_SIMILARITY
