@@ -39,6 +39,15 @@ THUMB_SIZE = (512, 512)
 # via PHOTO_MIN_SIMILARITY for other embedding models.
 MIN_SIMILARITY = float(os.environ.get("PHOTO_MIN_SIMILARITY", "0.5") or 0)
 
+# Graph-augmented search: fold the entity graph into ranking. The query is also
+# run through khora's entity vector search; photos that are a source of a
+# query-matching entity (e.g. "castle" -> the PLACE node linking 4 photos) are
+# fused with the recall results. This surfaces connected photos whose own
+# description matched weakly. Set PHOTO_GRAPH_SEARCH=0 to disable.
+GRAPH_SEARCH = os.environ.get("PHOTO_GRAPH_SEARCH", "1") not in ("0", "false", "False", "")
+GRAPH_ENTITY_LIMIT = int(os.environ.get("PHOTO_GRAPH_ENTITY_LIMIT", "8"))
+GRAPH_WEIGHT = float(os.environ.get("PHOTO_GRAPH_WEIGHT", "1.0") or 0)
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     await kc.startup()
@@ -510,6 +519,39 @@ def _py_match(
     return True
 
 
+def _rrf(rankings: list[tuple[list[str], float]], k: int = 60) -> list[tuple[str, float]]:
+    """Reciprocal-rank-fuse several ranked id lists into one ranking.
+
+    Each input is (ordered_ids, weight). A doc's score is the weighted sum of
+    1/(k+rank) across the lists it appears in, so docs ranked highly by *both*
+    vector recall and the entity graph rise to the top. Scale-free — no need to
+    reconcile cosine vs rank units. Returns (id, score) sorted best-first."""
+    scores: dict[str, float] = {}
+    for ids, weight in rankings:
+        for rank, key in enumerate(ids):
+            scores[key] = scores.get(key, 0.0) + weight / (k + rank)
+    return sorted(scores.items(), key=lambda kv: -kv[1])
+
+
+async def _entity_doc_ranking(q: str, ns: Any) -> list[str]:
+    """Rank document ids by the entity graph: find entities matching the query
+    (vector search over entity embeddings), then list the photos that are their
+    sources, best-matching-entity first."""
+    try:
+        ents = await kc.kb().search_entities(q, namespace=ns, limit=GRAPH_ENTITY_LIMIT, include_sources=True)
+    except Exception:
+        return []
+    order: list[str] = []
+    seen: set[str] = set()
+    for ent in ents:
+        for did in getattr(ent, "source_document_ids", None) or []:
+            key = str(did)
+            if key not in seen:
+                seen.add(key)
+                order.append(key)
+    return order
+
+
 @app.get("/gallery")
 async def gallery(limit: int = 500) -> dict[str, Any]:
     docs = await kc.kb().list_documents(namespace=kc.namespace(), limit=limit)
@@ -536,21 +578,54 @@ async def search(
         # Relevance floor (MIN_SIMILARITY) keeps the result set to photos that
         # actually relate to the query instead of returning the whole library
         # ranked. Passed only when >0 so a 0 override restores "return all".
+        ns = kc.namespace()
         recall_kwargs: dict[str, Any] = {}
         if MIN_SIMILARITY > 0:
             recall_kwargs["min_similarity"] = MIN_SIMILARITY
-        result = await kc.kb().recall(q, namespace=kc.namespace(), limit=limit, filter=flt, **recall_kwargs)
-        docs = {d.id: d for d in result.documents}
-        photos: list[dict[str, Any]] = []
-        seen: set[Any] = set()
-        for ch in result.chunks:  # score-sorted; one photo == one document
-            if ch.document_id in seen:
-                continue
-            seen.add(ch.document_id)
-            doc = docs.get(ch.document_id)
-            if doc is not None:
-                photos.append(_photo_dto(doc, description=ch.content, score=ch.score))
-        return {"photos": photos, "mode": "semantic"}
+        result = await kc.kb().recall(q, namespace=ns, limit=limit, filter=flt, **recall_kwargs)
+
+        # Recall ranking: one entry per document, chunks are score-sorted.
+        docs: dict[str, Any] = {str(d.id): d for d in result.documents}
+        chunk_for: dict[str, Any] = {}
+        recall_order: list[str] = []
+        for ch in result.chunks:
+            key = str(ch.document_id)
+            if key not in chunk_for:
+                chunk_for[key] = ch
+                recall_order.append(key)
+
+        # Graph leg: photos sharing an entity that matches the query, fused in.
+        graph_order = await _entity_doc_ranking(q, ns) if GRAPH_SEARCH else []
+        if graph_order:
+            fused = _rrf([(recall_order, 1.0), (graph_order, GRAPH_WEIGHT)])
+        else:
+            fused = [(key, 1.0 / (60 + i)) for i, key in enumerate(recall_order)]
+
+        # Display score = relative rank within the fused set (top = 1.0); the bar
+        # in the UI reads it as "ranked against the others", not absolute match.
+        hi = fused[0][1] if fused else 1.0
+        lo = fused[-1][1] if fused else 0.0
+        span = (hi - lo) or 1.0
+        mode = "semantic+graph" if graph_order else "semantic"
+
+        photos = []
+        for key, raw in fused:
+            doc = docs.get(key)
+            if doc is None:  # graph-only hit: not returned by recall, fetch it
+                try:
+                    doc = await kc.kb().get_document(uuid.UUID(key), namespace=ns)
+                except Exception:
+                    doc = None
+                if doc is None:
+                    continue
+                # graph-injected photos must still honour any active chip filters
+                if flt and not _py_match(_custom(getattr(doc, "metadata", None)), location, scene, objects, tags, date_from, date_to):
+                    continue
+            ch = chunk_for.get(key)
+            photos.append(_photo_dto(doc, description=ch.content if ch else None, score=(raw - lo) / span))
+            if len(photos) >= limit:
+                break
+        return {"photos": photos, "mode": mode}
 
     # Filter-only browse: enumerate all docs and match in Python (true "show all matching").
     docs_all = await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)
