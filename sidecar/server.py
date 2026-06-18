@@ -166,7 +166,12 @@ def _reverse_geocode(lat: float, lon: float) -> dict[str, str]:
             cc = r.get("cc", "")
             c = pycountry.countries.get(alpha_2=cc)
             country = c.name if c else cc
-            return {"gps_city": r.get("name", ""), "gps_admin1": r.get("admin1", ""), "gps_country": country}
+            return {
+                "gps_city": r.get("name", ""),
+                "gps_admin1": r.get("admin1", ""),
+                "gps_country": country,
+                "gps_country_code": cc,
+            }
     except Exception:
         pass
     return {}
@@ -209,6 +214,7 @@ def _photo_dto(doc: Any, *, description: str | None = None, score: float | None 
         "gps_city": c.get("gps_city"),
         "gps_admin1": c.get("gps_admin1"),
         "gps_country": c.get("gps_country"),
+        "gps_country_code": c.get("gps_country_code"),
         "score": score,
     }
 
@@ -310,7 +316,7 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                 desc, vusage = await describe_image(path)
                 _record_usage(vusage["model"], vusage["input"], vusage["output"])
                 await asyncio.to_thread(_make_thumbnail, path, ext_id)
-                place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country")]
+                place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country"), geo.get("gps_country_code")]
                 place_suffix = ", ".join(p for p in place_parts if p)
                 base_content = desc["description"] or f"Photo: {path.name}"
                 content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
