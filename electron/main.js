@@ -164,6 +164,9 @@ function hfUrl(repo, file) {
 }
 
 // Stream a download to disk (with backpressure), reporting fraction complete.
+// Writes to a .part file and only promotes it to `dest` once the full
+// content-length has arrived, so a dropped/truncated connection can't leave a
+// corrupt model that later looks valid. Cleans up the .part on any failure.
 async function downloadTo(url, dest, onProgress) {
   const res = await fetch(url);
   if (!res.ok || !res.body) throw new Error(`download failed (${res.status})`);
@@ -171,12 +174,22 @@ async function downloadTo(url, dest, onProgress) {
   const tmp = `${dest}.part`;
   const out = fs.createWriteStream(tmp);
   let received = 0;
-  for await (const chunk of res.body) {
-    received += chunk.length;
-    if (!out.write(Buffer.from(chunk))) await new Promise((r) => out.once("drain", r));
-    if (total) onProgress(received / total);
+  try {
+    for await (const chunk of res.body) {
+      received += chunk.length;
+      if (!out.write(Buffer.from(chunk))) await new Promise((r) => out.once("drain", r));
+      if (total) onProgress(received / total);
+    }
+    await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+  } catch (err) {
+    out.destroy();
+    fs.rmSync(tmp, { force: true });
+    throw err;
   }
-  await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+  if (total && received !== total) {
+    fs.rmSync(tmp, { force: true });
+    throw new Error(`download incomplete: got ${received} of ${total} bytes`);
+  }
   fs.renameSync(tmp, dest);
 }
 
