@@ -308,9 +308,23 @@ function writeSwapConfig() {
   fs.writeFileSync(swapConfigPath, cfg);
 }
 
+// Kill a spawned process AND its children. On POSIX we spawn detached (the child
+// is its own process-group leader), so signalling the negative pid reaps the
+// whole group — e.g. llama-swap plus every llama-server backend it spawned — so
+// quitting never leaves orphaned model servers running.
+function killTree(proc, signal = "SIGTERM") {
+  if (!proc || proc.killed) return;
+  try {
+    if (process.platform === "win32") proc.kill(signal);
+    else process.kill(-proc.pid, signal);
+  } catch {
+    /* already exited */
+  }
+}
+
 function stopSwap() {
   if (llamaSwap) {
-    llamaSwap.kill();
+    killTree(llamaSwap);
     llamaSwap = null;
   }
 }
@@ -323,6 +337,7 @@ async function startSwap() {
   writeSwapConfig();
   llamaSwap = spawn(swap, ["--config", swapConfigPath, "--listen", `127.0.0.1:${swapPort}`], {
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32", // own process group, so killTree reaps its llama-server children
   });
   llamaSwap.stdout.on("data", (d) => process.stdout.write(`[swap] ${d}`));
   llamaSwap.stderr.on("data", (d) => process.stderr.write(`[swap] ${d}`));
@@ -378,7 +393,7 @@ async function waitForUrl(url, timeoutMs = 30000) {
 
 function stopSidecar() {
   if (sidecar) {
-    sidecar.kill();
+    killTree(sidecar);
     sidecar = null;
   }
 }
@@ -401,7 +416,7 @@ async function startSidecar() {
   sidecar = spawn(
     PY,
     ["-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", String(sidecarPort), "--log-level", "warning"],
-    { cwd: SIDECAR_DIR, env, stdio: ["ignore", "pipe", "pipe"] }
+    { cwd: SIDECAR_DIR, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }
   );
   sidecar.stdout.on("data", (d) => process.stdout.write(`[sidecar] ${d}`));
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
