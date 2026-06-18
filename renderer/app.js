@@ -403,6 +403,8 @@ function renderGroups(photos, key) {
   const labelFor = (ph) => {
     if (key === "location") return ph.location || "No location";
     if (key === "scene") return ph.scene || "No scene";
+    if (key === "city") return ph.gps_city || "No city";
+    if (key === "country") return ph.gps_country || "No country";
     if (key === "date") return (ph.occurred_at || "").slice(0, 7) || "No date";
     return "Other";
   };
