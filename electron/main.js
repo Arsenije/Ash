@@ -292,7 +292,11 @@ function writeSwapConfig() {
   if (models.text) {
     cfg += `  text:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("text", "main"))}\n`;
   }
-  cfg += `  embed:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("embed", "main"))} --embedding\n`;
+  // Embed runs CPU-only (-ngl 0). It's tiny (~80 MB), so the latency cost is
+  // negligible, and it keeps the embedder off Metal so it can't contend with the
+  // GPU-heavy vision model — which was starving embed requests into ~30s empty
+  // responses during concurrent ingest. Verified: embed stays ~15ms under load.
+  cfg += `  embed:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} -ngl 0 -m ${q(modelPath("embed", "main"))} --embedding\n`;
   // Keep every active model co-resident (swap: false) instead of letting
   // llama-swap evict one to load another. Ingest hits describe (vision) then
   // embed back-to-back; swapping between them would kill an in-flight request
