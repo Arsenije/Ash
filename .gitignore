@@ -26,5 +26,8 @@ usage.json
 # OS
 .DS_Store
 
+# Local notes
+todo.md
+
 # Bundled/dev binaries
 vendor/

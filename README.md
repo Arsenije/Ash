@@ -15,7 +15,8 @@ Your photos **never leave your computer.** Nothing is uploaded, there's no accou
 ## What you can do
 
 - **Search in plain language.** Type what you remember and Ash finds matching photos using their descriptions.
-- **Filter precisely.** Narrow by `location`, `scene`, `object`, `tag`, or date — start typing a field and pick a value to add a removable filter chip. Anything left over runs a search alongside the filters.
+- **Filter precisely.** Narrow by `location`, `scene`, `object`, `tag`, `city`, `country`, or date — start typing a field and pick a value to add a removable filter chip. Anything left over runs a search alongside the filters.
+- **Find photos by where they were taken.** If a photo has GPS data, Ash extracts the city, region, and country offline and folds it into search. "budva beach" finds photos taken in Budva that match "beach" — no maps API, no network.
 - **Browse by theme.** Photos automatically group into Animals, Places, Objects, and Scenes, plus the people and things that show up again and again.
 - **Follow the connections.** Open any photo to see its full description, its attributes, and other photos that are visually or contextually related.
 - **Drag and drop to add photos.** Watch each one get scanned with live thumbnails, spinners, and a progress indicator.
@@ -88,7 +89,7 @@ Three local models do the work, all downloaded once (~3.5 GB): **SmolVLM2 2.2B**
 ```bash
 npm run binaries                                        # llama.cpp + llama-swap for this OS/arch
 cd sidecar && uv venv --python 3.13 .venv \             # python sidecar
-  && uv pip install --python .venv/bin/python "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart && cd ..
+  && uv pip install --python .venv/bin/python "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart reverse_geocoder pycountry && cd ..
 npm install                                             # electron deps
 npm start                                               # run
 ```

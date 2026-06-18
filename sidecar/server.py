@@ -15,6 +15,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pycountry
+import reverse_geocoder as rg
+
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
@@ -128,6 +131,52 @@ def _photo_datetime(path: Path) -> datetime:
     return datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
 
 
+def _photo_gps(path: Path) -> tuple[float, float] | None:
+    """Return (latitude, longitude) from EXIF GPS IFD, or None if absent."""
+    try:
+        exif = Image.open(path).getexif()
+        gps = exif.get_ifd(0x8825)  # GPS IFD
+        if not gps:
+            return None
+        lat_ref = gps.get(1)   # 'N' or 'S'
+        lat_dms = gps.get(2)   # (degrees, minutes, seconds)
+        lon_ref = gps.get(3)   # 'E' or 'W'
+        lon_dms = gps.get(4)
+        if not (lat_ref and lat_dms and lon_ref and lon_dms):
+            return None
+        def to_deg(dms, ref: str) -> float:
+            d, m, s = (float(x) for x in dms)
+            deg = d + m / 60 + s / 3600
+            return -deg if ref in ("S", "W") else deg
+        lat = to_deg(lat_dms, lat_ref)
+        lon = to_deg(lon_dms, lon_ref)
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            return None
+        return lat, lon
+    except Exception:
+        return None
+
+
+def _reverse_geocode(lat: float, lon: float) -> dict[str, str]:
+    """Return {city, admin1, country} for coordinates using local GeoNames data."""
+    try:
+        results = rg.search((lat, lon), verbose=False)
+        if results:
+            r = results[0]
+            cc = r.get("cc", "")
+            c = pycountry.countries.get(alpha_2=cc)
+            country = c.name if c else cc
+            return {
+                "gps_city": r.get("name", ""),
+                "gps_admin1": r.get("admin1", ""),
+                "gps_country": country,
+                "gps_country_code": cc,
+            }
+    except Exception:
+        pass
+    return {}
+
+
 def _make_thumbnail(path: Path, ext_id: str) -> None:
     out = kc.THUMBS_DIR / f"{ext_id}.webp"
     if out.exists():
@@ -160,6 +209,12 @@ def _photo_dto(doc: Any, *, description: str | None = None, score: float | None 
         "scene": c.get("scene") or None,
         "tags": c.get("tags", []),
         "occurred_at": c.get("occurred_at") or (st.isoformat() if st else None),
+        "gps_lat": c.get("gps_lat"),
+        "gps_lon": c.get("gps_lon"),
+        "gps_city": c.get("gps_city"),
+        "gps_admin1": c.get("gps_admin1"),
+        "gps_country": c.get("gps_country"),
+        "gps_country_code": c.get("gps_country_code"),
         "score": score,
     }
 
@@ -256,11 +311,17 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                     job["items"][key] = {"status": "skipped", "ext_id": ext_id}
                     return
                 dt = _photo_datetime(path)
+                gps = _photo_gps(path)
+                geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
                 desc, vusage = await describe_image(path)
                 _record_usage(vusage["model"], vusage["input"], vusage["output"])
                 await asyncio.to_thread(_make_thumbnail, path, ext_id)
+                place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country"), geo.get("gps_country_code")]
+                place_suffix = ", ".join(p for p in place_parts if p)
+                base_content = desc["description"] or f"Photo: {path.name}"
+                content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
                 result = await kc.kb().remember(
-                    content=desc["description"] or f"Photo: {path.name}",
+                    content=content,
                     namespace=kc.namespace(),
                     title=path.name,
                     source_type="photo",
@@ -276,6 +337,9 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                             "tags": desc["tags"],
                             "occurred_at": dt.isoformat(),
                             "filename": path.name,
+                            "gps_lat": gps[0] if gps else None,
+                            "gps_lon": gps[1] if gps else None,
+                            **geo,
                         }
                     },
                     entity_types=ENTITY_TYPES,
@@ -350,13 +414,19 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         return
                     ext_id = it["external_id"] or _hash_file(path)
                     dt = it["source_timestamp"] or _photo_datetime(path)
+                    gps = _photo_gps(path)
+                    geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
                     # Describe first; if it raises we keep the existing doc (no data loss).
                     desc, vusage = await describe_image(path)
                     _record_usage(vusage["model"], vusage["input"], vusage["output"])
                     await asyncio.to_thread(_make_thumbnail, path, ext_id)
+                    place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country")]
+                    place_suffix = ", ".join(p for p in place_parts if p)
+                    base_content = desc["description"] or f"Photo: {path.name}"
+                    content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
                     await kc.kb().forget(it["doc_id"], namespace=ns)
                     result = await kc.kb().remember(
-                        content=desc["description"] or f"Photo: {path.name}",
+                        content=content,
                         namespace=ns,
                         title=it["title"] or path.name,
                         source_type="photo",
@@ -372,6 +442,9 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                                 "tags": desc["tags"],
                                 "occurred_at": dt.isoformat() if hasattr(dt, "isoformat") else str(dt),
                                 "filename": path.name,
+                                "gps_lat": gps[0] if gps else None,
+                                "gps_lon": gps[1] if gps else None,
+                                **geo,
                             }
                         },
                         entity_types=ENTITY_TYPES,
@@ -415,6 +488,8 @@ def _build_filter(
     tags: list[str],
     date_from: str | None,
     date_to: str | None,
+    city: str | None = None,
+    country: str | None = None,
 ) -> dict[str, Any] | None:
     f: dict[str, Any] = {}
     if location:
@@ -432,6 +507,10 @@ def _build_filter(
         if date_to:
             rng["$lte"] = date_to
         f["metadata.custom.occurred_at"] = rng
+    if city:
+        f["metadata.custom.gps_city"] = city
+    if country:
+        f["metadata.custom.gps_country"] = country
     return f or None
 
 
@@ -443,6 +522,8 @@ def _py_match(
     tags: list[str],
     date_from: str | None,
     date_to: str | None,
+    city: str | None = None,
+    country: str | None = None,
 ) -> bool:
     if location and (c.get("location") or "").lower() != location.lower():
         return False
@@ -456,6 +537,10 @@ def _py_match(
     if date_from and oa < date_from:
         return False
     if date_to and oa > date_to:
+        return False
+    if city and (c.get("gps_city") or "").lower() != city.lower():
+        return False
+    if country and (c.get("gps_country") or "").lower() != country.lower():
         return False
     return True
 
@@ -477,12 +562,14 @@ async def search(
     tags: list[str] = Query(default=[]),
     date_from: str | None = None,
     date_to: str | None = None,
+    city: str | None = None,
+    country: str | None = None,
     limit: int = 200,
 ) -> dict[str, Any]:
     q = q.strip()
 
     if q:
-        flt = _build_filter(location, scene, objects, tags, date_from, date_to)
+        flt = _build_filter(location, scene, objects, tags, date_from, date_to, city, country)
         result = await kc.kb().recall(q, namespace=kc.namespace(), limit=limit, filter=flt)
         docs = {d.id: d for d in result.documents}
         photos: list[dict[str, Any]] = []
@@ -501,7 +588,7 @@ async def search(
     photos = [
         _photo_dto(d)
         for d in docs_all
-        if _py_match(_custom(getattr(d, "metadata", None)), location, scene, objects, tags, date_from, date_to)
+        if _py_match(_custom(getattr(d, "metadata", None)), location, scene, objects, tags, date_from, date_to, city, country)
     ]
     photos.sort(key=lambda p: p["occurred_at"] or "", reverse=True)
     return {"photos": photos[:limit], "mode": "browse"}
@@ -515,6 +602,8 @@ async def facets() -> dict[str, list[str]]:
     objects: set[str] = set()
     animals: set[str] = set()
     tags: set[str] = set()
+    cities: set[str] = set()
+    countries: set[str] = set()
     for d in docs:
         c = _custom(getattr(d, "metadata", None))
         if c.get("location"):
@@ -524,12 +613,18 @@ async def facets() -> dict[str, list[str]]:
         objects.update(c.get("objects", []))
         animals.update(c.get("animals", []))
         tags.update(c.get("tags", []))
+        if c.get("gps_city"):
+            cities.add(c["gps_city"])
+        if c.get("gps_country"):
+            countries.add(c["gps_country"])
     return {
         "location": sorted(locations),
         "scene": sorted(scenes),
         "objects": sorted(objects),
         "animals": sorted(animals),
         "tags": sorted(tags),
+        "cities": sorted(cities),
+        "countries": sorted(countries),
     }
 
 
