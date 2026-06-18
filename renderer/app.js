@@ -8,6 +8,8 @@ const FIELDS = [
   { key: "tag", label: "tag", kind: "multi", facet: "tags", param: "tags" },
   { key: "after", label: "after", kind: "date", param: "date_from" },
   { key: "before", label: "before", kind: "date", param: "date_to" },
+  { key: "city", label: "city", kind: "single", facet: "cities", param: "city" },
+  { key: "country", label: "country", kind: "single", facet: "countries", param: "country" },
 ];
 
 const state = {

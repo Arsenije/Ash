@@ -478,6 +478,8 @@ def _build_filter(
     tags: list[str],
     date_from: str | None,
     date_to: str | None,
+    city: str | None = None,
+    country: str | None = None,
 ) -> dict[str, Any] | None:
     f: dict[str, Any] = {}
     if location:
@@ -495,6 +497,10 @@ def _build_filter(
         if date_to:
             rng["$lte"] = date_to
         f["metadata.custom.occurred_at"] = rng
+    if city:
+        f["metadata.custom.gps_city"] = city
+    if country:
+        f["metadata.custom.gps_country"] = country
     return f or None
 
 
@@ -506,6 +512,8 @@ def _py_match(
     tags: list[str],
     date_from: str | None,
     date_to: str | None,
+    city: str | None = None,
+    country: str | None = None,
 ) -> bool:
     if location and (c.get("location") or "").lower() != location.lower():
         return False
@@ -519,6 +527,10 @@ def _py_match(
     if date_from and oa < date_from:
         return False
     if date_to and oa > date_to:
+        return False
+    if city and (c.get("gps_city") or "").lower() != city.lower():
+        return False
+    if country and (c.get("gps_country") or "").lower() != country.lower():
         return False
     return True
 
@@ -540,12 +552,14 @@ async def search(
     tags: list[str] = Query(default=[]),
     date_from: str | None = None,
     date_to: str | None = None,
+    city: str | None = None,
+    country: str | None = None,
     limit: int = 200,
 ) -> dict[str, Any]:
     q = q.strip()
 
     if q:
-        flt = _build_filter(location, scene, objects, tags, date_from, date_to)
+        flt = _build_filter(location, scene, objects, tags, date_from, date_to, city, country)
         result = await kc.kb().recall(q, namespace=kc.namespace(), limit=limit, filter=flt)
         docs = {d.id: d for d in result.documents}
         photos: list[dict[str, Any]] = []
@@ -564,7 +578,7 @@ async def search(
     photos = [
         _photo_dto(d)
         for d in docs_all
-        if _py_match(_custom(getattr(d, "metadata", None)), location, scene, objects, tags, date_from, date_to)
+        if _py_match(_custom(getattr(d, "metadata", None)), location, scene, objects, tags, date_from, date_to, city, country)
     ]
     photos.sort(key=lambda p: p["occurred_at"] or "", reverse=True)
     return {"photos": photos[:limit], "mode": "browse"}
@@ -578,6 +592,8 @@ async def facets() -> dict[str, list[str]]:
     objects: set[str] = set()
     animals: set[str] = set()
     tags: set[str] = set()
+    cities: set[str] = set()
+    countries: set[str] = set()
     for d in docs:
         c = _custom(getattr(d, "metadata", None))
         if c.get("location"):
@@ -587,12 +603,18 @@ async def facets() -> dict[str, list[str]]:
         objects.update(c.get("objects", []))
         animals.update(c.get("animals", []))
         tags.update(c.get("tags", []))
+        if c.get("gps_city"):
+            cities.add(c["gps_city"])
+        if c.get("gps_country"):
+            countries.add(c["gps_country"])
     return {
         "location": sorted(locations),
         "scene": sorted(scenes),
         "objects": sorted(objects),
         "animals": sorted(animals),
         "tags": sorted(tags),
+        "cities": sorted(cities),
+        "countries": sorted(countries),
     }
 
 
