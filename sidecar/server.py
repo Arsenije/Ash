@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import uuid
@@ -15,9 +16,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
@@ -30,9 +31,33 @@ INGEST_CONCURRENCY = 4
 THUMB_SIZE = (512, 512)
 
 app = FastAPI(title="photo-gallery sidecar")
+
+# Per-session shared secret, minted by the Electron main process and handed to
+# both this sidecar (env) and the renderer (IPC). Every request must present it.
+# Empty when launched standalone (e.g. `uvicorn server:app` for dev) — then the
+# gate is disabled, matching the loopback-only, single-user assumption.
+SIDECAR_TOKEN = os.environ.get("PHOTO_SIDECAR_TOKEN", "")
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    # The renderer sends the token as a header on fetch() and as a ?token= query
+    # param on <img> URLs (image elements can't set custom headers). Preflight
+    # (OPTIONS) carries neither and must pass through to CORS handling.
+    if SIDECAR_TOKEN and request.method != "OPTIONS":
+        supplied = request.headers.get("x-ash-token") or request.query_params.get("token") or ""
+        if not hmac.compare_digest(supplied, SIDECAR_TOKEN):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+# CORS must stay permissive: the renderer is a file:// page, so every request to
+# this http://127.0.0.1 service is cross-origin (Origin: null). The access
+# boundary is the token above, not the origin — a page that lacks the token gets
+# 401 regardless of whether it could read the response.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 127.0.0.1-only service; renderer is a local file://
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

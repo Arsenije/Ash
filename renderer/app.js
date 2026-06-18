@@ -12,6 +12,7 @@ const FIELDS = [
 
 const state = {
   baseUrl: "",
+  token: "", // per-session secret for the sidecar API (from main via IPC)
   configured: false, // an engine has been chosen
   ready: false, // sidecar is up and able to ingest/search
   hardware: null,
@@ -30,8 +31,23 @@ const el = (tag, cls) => {
   return e;
 };
 
+// Headers carrying the sidecar token; merge in any extra headers (e.g. JSON).
+function authHeaders(extra) {
+  const h = { ...extra };
+  if (state.token) h["X-Ash-Token"] = state.token;
+  return h;
+}
+
+// Media (<img>) can't set headers, so the token rides as a query param instead.
+function mediaUrl(path) {
+  if (!path) return path;
+  const url = state.baseUrl + path;
+  if (!state.token) return url;
+  return url + (path.includes("?") ? "&" : "?") + "token=" + encodeURIComponent(state.token);
+}
+
 async function getJSON(path) {
-  const res = await fetch(state.baseUrl + path);
+  const res = await fetch(state.baseUrl + path, { headers: authHeaders() });
   if (!res.ok) throw new Error(`${path} -> ${res.status}`);
   return res.json();
 }
@@ -320,7 +336,7 @@ function renderGrid(photos, mode) {
     if (ph.src === null) card.classList.add("missing");
     const img = el("img");
     img.loading = "lazy";
-    if (ph.thumb_url) img.src = state.baseUrl + ph.thumb_url;
+    if (ph.thumb_url) img.src = mediaUrl(ph.thumb_url);
     card.appendChild(img);
     if (ph.score != null) {
       const s = el("div", "score");
@@ -373,7 +389,7 @@ function renderSections(sections, emptyMsg) {
     for (const ph of t.photos) {
       const img = el("img");
       img.loading = "lazy";
-      if (ph.thumb_url) img.src = state.baseUrl + ph.thumb_url;
+      if (ph.thumb_url) img.src = mediaUrl(ph.thumb_url);
       img.title = ph.title || "";
       img.onclick = () => openDetail(ph.id);
       strip.appendChild(img);
@@ -426,7 +442,7 @@ async function openDetail(id) {
   } catch {
     return;
   }
-  $("#d-img").src = state.baseUrl + "/image/" + id;
+  $("#d-img").src = mediaUrl("/image/" + id);
   $("#d-title").textContent = ph.title || "";
   $("#d-desc").textContent = ph.description || "";
   const attrs = $("#d-attrs");
@@ -450,7 +466,7 @@ async function openDetail(id) {
     const r = await getJSON("/related/" + id);
     for (const rp of r.photos) {
       const img = el("img");
-      if (rp.thumb_url) img.src = state.baseUrl + rp.thumb_url;
+      if (rp.thumb_url) img.src = mediaUrl(rp.thumb_url);
       img.title = `${rp.shared_entities} shared`;
       img.onclick = () => openDetail(rp.id);
       rel.appendChild(img);
@@ -541,7 +557,7 @@ async function ingestDrop(entries) {
   try {
     const res = await fetch(state.baseUrl + "/ingest", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ paths: entries.map((e) => e.path) }),
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
@@ -649,6 +665,7 @@ function applyStatus(res) {
   state.runtime = res.runtime;
   if (res.version) state.version = res.version;
   if (res.baseUrl) state.baseUrl = res.baseUrl;
+  if (res.token) state.token = res.token;
 }
 
 // ---------------------------------------------------------------------------
@@ -679,7 +696,7 @@ async function runRescan(mode) {
   try {
     const res = await fetch(state.baseUrl + "/rescan", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ mode }),
     });
     if (!res.ok) throw new Error("HTTP " + res.status);
