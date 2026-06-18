@@ -1,7 +1,7 @@
 "use strict";
 
 const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 
 app.setName("Ash");
 const crypto = require("node:crypto");
@@ -322,6 +322,35 @@ function killTree(proc, signal = "SIGTERM") {
   }
 }
 
+// Reap llama-swap / llama-server processes left over from a previous session that
+// didn't shut down cleanly (a crash or force-quit skips before-quit, so killTree
+// never ran). Matched by our own config + models paths, so unrelated llama
+// processes are never touched. Run once at startup before spawning fresh ones —
+// accumulated orphans each hold GPU/unified memory and would starve the new
+// session's models (the embed-server starvation we saw).
+function reapOrphans() {
+  if (process.platform === "win32") return; // pgrep is POSIX-only; Windows reap TODO
+  const pids = new Set();
+  for (const needle of [swapConfigPath, modelsDir].filter(Boolean)) {
+    try {
+      for (const line of execFileSync("pgrep", ["-f", needle], { encoding: "utf8" }).split("\n")) {
+        const pid = Number.parseInt(line, 10);
+        if (pid && pid !== process.pid) pids.add(pid);
+      }
+    } catch {
+      /* pgrep exits 1 when nothing matches */
+    }
+  }
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  if (pids.size) console.log(`reaped ${pids.size} orphaned runtime process(es) from a previous session`);
+}
+
 function stopSwap() {
   if (llamaSwap) {
     killTree(llamaSwap);
@@ -531,6 +560,7 @@ app.whenReady().then(async () => {
   swapConfigPath = path.join(userData, "llama-swap.yaml");
   settingsPath = path.join(userData, "settings.json");
   fs.mkdirSync(dataDir, { recursive: true });
+  reapOrphans(); // clear runtime processes orphaned by a previous crash/force-quit before starting fresh
 
   app.setAboutPanelOptions({ applicationName: "Ash", applicationVersion: app.getVersion() });
   if (process.platform === "darwin" && app.dock && fs.existsSync(ICON)) app.dock.setIcon(ICON);
