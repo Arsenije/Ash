@@ -141,6 +141,14 @@ def _custom(meta: dict[str, Any] | None) -> dict[str, Any]:
     return (meta or {}).get("custom", {}) or {}
 
 
+def _parse_uuid(doc_id: str) -> uuid.UUID:
+    """Parse a path-segment doc id, returning 404 (not an unhandled 500) if malformed."""
+    try:
+        return uuid.UUID(doc_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "not found")
+
+
 def _photo_dto(doc: Any, *, description: str | None = None, score: float | None = None) -> dict[str, Any]:
     """Map a Document or DocumentProjection to the gallery DTO (defensive getattr)."""
     meta = getattr(doc, "metadata", None) or {}
@@ -578,7 +586,7 @@ async def themes(limit_per_theme: int = 60) -> dict[str, Any]:
 async def related(doc_id: str, limit: int = 12) -> dict[str, Any]:
     from collections import Counter
 
-    target = uuid.UUID(doc_id)
+    target = _parse_uuid(doc_id)
     counts: Counter[Any] = Counter()
     for t in ENTITY_TYPES:
         for e in await kc.kb().list_entities(
@@ -601,7 +609,7 @@ async def related(doc_id: str, limit: int = 12) -> dict[str, Any]:
 
 @app.get("/photo/{doc_id}")
 async def photo(doc_id: str) -> dict[str, Any]:
-    doc = await kc.kb().get_document(uuid.UUID(doc_id), namespace=kc.namespace())
+    doc = await kc.kb().get_document(_parse_uuid(doc_id), namespace=kc.namespace())
     if doc is None:
         raise HTTPException(404, "not found")
     dto = _photo_dto(doc)
@@ -611,7 +619,7 @@ async def photo(doc_id: str) -> dict[str, Any]:
 
 @app.get("/image/{doc_id}")
 async def image(doc_id: str) -> FileResponse:
-    doc = await kc.kb().get_document(uuid.UUID(doc_id), namespace=kc.namespace())
+    doc = await kc.kb().get_document(_parse_uuid(doc_id), namespace=kc.namespace())
     if doc is None or not doc.source_url:
         raise HTTPException(404, "not found")
     p = Path(doc.source_url)
