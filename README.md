@@ -68,6 +68,15 @@ Photos are **never copied or uploaded.** Ash stores only a description and the f
 
 ---
 
+## Changelog
+
+### 1.1 — 2026-06-18
+
+- **Security & correctness hardening + graph-augmented search** (Damir Krstanovic, [#5](https://github.com/Arsenije/Ash/pull/5)) — gates the sidecar HTTP API with a per-session token, adds a strict Content-Security-Policy to the renderer, and verifies model-download completeness so a dropped connection can't leave a truncated model file. Search now shows a relative-match bar with an opt-in relevance floor (default `0.5`) and folds khora's entity graph into ranking, surfacing connected photos that matched weakly on their own.
+- **Offline GPS reverse geocoding** (Aleksandar Ristic, [#4](https://github.com/Arsenije/Ash/pull/4)) — extracts GPS coordinates from photo EXIF at ingest and reverse-geocodes them fully offline (local GeoNames dataset + `pycountry`), so you can search, filter, and group photos by city and country. The detail view shows a readable place name (e.g. "Budva, Montenegro, ME") instead of raw coordinates. Photos without GPS data are unaffected.
+
+---
+
 ## How it works (for the curious)
 
 Ash runs entirely on your machine. The pipeline looks like this:
