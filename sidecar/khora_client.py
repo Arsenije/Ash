@@ -47,7 +47,9 @@ def _build_config() -> KhoraConfig:
     #   KHORA_LLM_MODEL / KHORA_EXTRACTION_MODEL / KHORA_EMBED_MODEL.
     # For local/custom engines these carry an ``openai/`` prefix and litellm is
     # pointed at the OpenAI-compatible server via OPENAI_BASE_URL / OPENAI_API_BASE.
-    # Unset -> khora's defaults (OpenAI hosted). Reranking stays OFF (no torch).
+    # Unset -> khora's defaults (OpenAI hosted). NOTE: khora[embedded] pulls in
+    # torch, so its cross-encoder reranker is active by default (confirmed in the
+    # recall logs) — it reranks the fused candidates before returning.
     if model := os.environ.get("KHORA_LLM_MODEL"):
         config.llm.model = model
     if ext := os.environ.get("KHORA_EXTRACTION_MODEL"):

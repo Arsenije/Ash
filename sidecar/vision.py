@@ -10,16 +10,21 @@ SDK directly with an image message (same pattern as the repo's
 from __future__ import annotations
 
 import base64
+import io
 import json
-import mimetypes
 import os
 import re
 from pathlib import Path
 from typing import Any
 
 from openai import AsyncOpenAI
+from PIL import Image, ImageOps
 
 VISION_MODEL = os.environ.get("PHOTO_VISION_MODEL", "gpt-4o-mini")
+# Longest edge sent to the vision model. The original can be tens of megapixels;
+# sending it whole wastes memory and tokens, and llama.cpp ignores the OpenAI
+# `detail` hint, so we downscale ourselves.
+VISION_MAX_DIM = int(os.environ.get("PHOTO_VISION_MAX_DIM", "768"))
 
 _SYSTEM = (
     "You describe photographs for a searchable gallery. Return STRICT JSON with keys:\n"
@@ -97,10 +102,19 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+def _encode_image(path: Path) -> str:
+    """Downscale (respecting EXIF orientation) and re-encode to a base64 JPEG."""
+    img = ImageOps.exif_transpose(Image.open(path))
+    img.thumbnail((VISION_MAX_DIM, VISION_MAX_DIM))
+    buf = io.BytesIO()
+    img.convert("RGB").save(buf, "JPEG", quality=85)
+    return base64.b64encode(buf.getvalue()).decode()
+
+
 async def describe_image(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return (attributes, usage) where usage = {model, input, output} token counts."""
-    mime = mimetypes.guess_type(str(path))[0] or "image/jpeg"
-    b64 = base64.b64encode(path.read_bytes()).decode()
+    mime = "image/jpeg"
+    b64 = _encode_image(path)
     resp = await _get_client().chat.completions.create(
         model=VISION_MODEL,
         response_format=_RESPONSE_FORMAT,

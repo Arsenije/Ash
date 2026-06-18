@@ -4,6 +4,7 @@ const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
 const { spawn } = require("node:child_process");
 
 app.setName("Ash");
+const crypto = require("node:crypto");
 const net = require("node:net");
 const os = require("node:os");
 const path = require("node:path");
@@ -20,6 +21,7 @@ const ICON = path.join(ROOT, "assets", "icon.png"); // drop a 1024×1024 PNG her
 let mainWindow = null;
 let sidecar = null;
 let sidecarPort = 0;
+let sidecarToken = ""; // per-session shared secret guarding the sidecar HTTP API
 let llamaSwap = null;
 let swapPort = 0;
 let dataDir = "";
@@ -162,6 +164,9 @@ function hfUrl(repo, file) {
 }
 
 // Stream a download to disk (with backpressure), reporting fraction complete.
+// Writes to a .part file and only promotes it to `dest` once the full
+// content-length has arrived, so a dropped/truncated connection can't leave a
+// corrupt model that later looks valid. Cleans up the .part on any failure.
 async function downloadTo(url, dest, onProgress) {
   const res = await fetch(url);
   if (!res.ok || !res.body) throw new Error(`download failed (${res.status})`);
@@ -169,12 +174,22 @@ async function downloadTo(url, dest, onProgress) {
   const tmp = `${dest}.part`;
   const out = fs.createWriteStream(tmp);
   let received = 0;
-  for await (const chunk of res.body) {
-    received += chunk.length;
-    if (!out.write(Buffer.from(chunk))) await new Promise((r) => out.once("drain", r));
-    if (total) onProgress(received / total);
+  try {
+    for await (const chunk of res.body) {
+      received += chunk.length;
+      if (!out.write(Buffer.from(chunk))) await new Promise((r) => out.once("drain", r));
+      if (total) onProgress(received / total);
+    }
+    await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+  } catch (err) {
+    out.destroy();
+    fs.rmSync(tmp, { force: true });
+    throw err;
   }
-  await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
+  if (total && received !== total) {
+    fs.rmSync(tmp, { force: true });
+    throw new Error(`download incomplete: got ${received} of ${total} bytes`);
+  }
   fs.renameSync(tmp, dest);
 }
 
@@ -260,11 +275,12 @@ function freePort() {
   });
 }
 
-async function waitForHealth(port, timeoutMs = 60000) {
+async function waitForHealth(port, token, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
+  const headers = token ? { "X-Ash-Token": token } : undefined;
   while (Date.now() < deadline) {
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
+      const res = await fetch(`http://127.0.0.1:${port}/health`, { headers });
       if (res.ok) return true;
     } catch {
       /* not up yet */
@@ -300,10 +316,12 @@ async function startSidecar() {
   const engine = loadEngine();
   if (!engine) return 0; // nothing to run until the user picks an engine
   sidecarPort = await freePort();
+  sidecarToken = crypto.randomBytes(32).toString("hex"); // fresh per launch
   const env = {
     ...process.env,
     KHORA_PHOTO_DATA_DIR: dataDir,
     PHOTO_SIDECAR_PORT: String(sidecarPort),
+    PHOTO_SIDECAR_TOKEN: sidecarToken,
     PYTHONUNBUFFERED: "1",
     ...engineEnv(engine),
   };
@@ -317,7 +335,7 @@ async function startSidecar() {
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
   sidecar.on("exit", (code) => console.log(`[sidecar] exited ${code}`));
 
-  const ok = await waitForHealth(sidecarPort);
+  const ok = await waitForHealth(sidecarPort, sidecarToken);
   if (!ok) throw new Error("sidecar failed to become healthy");
   return sidecarPort;
 }
@@ -337,6 +355,7 @@ async function engineStatus() {
   return {
     configured: Boolean(engine),
     baseUrl: sidecarPort ? `http://127.0.0.1:${sidecarPort}` : "",
+    token: sidecarToken,
     ready: Boolean(engine) && sidecarPort > 0,
     runtime: { available: runtimeAvailable(), modelsReady: modelsPresent() },
     hardware: hardwareTier(),

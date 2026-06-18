@@ -8,9 +8,11 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import uuid
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -18,9 +20,9 @@ from typing import Any
 import pycountry
 import reverse_geocoder as rg
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
@@ -31,17 +33,76 @@ from vision import describe_image
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
 INGEST_CONCURRENCY = 4
 THUMB_SIZE = (512, 512)
+# Relevance floor for semantic search (raw cosine, applied before khora
+# normalizes scores into a [0,1] rank). 0 disables it. Default 0.5 is
+# calibrated for the bundled nomic-embed-text-v1.5 model: on a real ingest it
+# kept loose-but-valid matches ("pet" -> the cat, "seaside" -> the beach) while
+# dropping nonsense queries and unrelated images (0.3 was a no-op — nomic's
+# baseline cosine is high; 0.6 started cutting valid fuzzy matches). Override
+# via PHOTO_MIN_SIMILARITY for other embedding models.
+MIN_SIMILARITY = float(os.environ.get("PHOTO_MIN_SIMILARITY", "0.5") or 0)
 
-app = FastAPI(title="photo-gallery sidecar")
+# Graph-augmented search: fold the entity graph into ranking. The query is also
+# run through khora's entity vector search; photos that are a source of a
+# query-matching entity (e.g. "castle" -> the PLACE node linking 4 photos) are
+# fused with the recall results. This surfaces connected photos whose own
+# description matched weakly. Set PHOTO_GRAPH_SEARCH=0 to disable.
+GRAPH_SEARCH = os.environ.get("PHOTO_GRAPH_SEARCH", "1") not in ("0", "false", "False", "")
+GRAPH_ENTITY_LIMIT = int(os.environ.get("PHOTO_GRAPH_ENTITY_LIMIT", "8"))
+GRAPH_WEIGHT = float(os.environ.get("PHOTO_GRAPH_WEIGHT", "1.0") or 0)
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    await kc.startup()
+    _load_usage()
+    yield
+    await kc.shutdown()
+
+
+app = FastAPI(title="photo-gallery sidecar", lifespan=_lifespan)
+
+# Per-session shared secret, minted by the Electron main process and handed to
+# both this sidecar (env) and the renderer (IPC). Every request must present it.
+# Empty when launched standalone (e.g. `uvicorn server:app` for dev) — then the
+# gate is disabled, matching the loopback-only, single-user assumption.
+SIDECAR_TOKEN = os.environ.get("PHOTO_SIDECAR_TOKEN", "")
+
+
+@app.middleware("http")
+async def _require_token(request: Request, call_next):
+    # The renderer sends the token as a header on fetch() and as a ?token= query
+    # param on <img> URLs (image elements can't set custom headers). Preflight
+    # (OPTIONS) carries neither and must pass through to CORS handling.
+    if SIDECAR_TOKEN and request.method != "OPTIONS":
+        supplied = request.headers.get("x-ash-token") or request.query_params.get("token") or ""
+        if not hmac.compare_digest(supplied, SIDECAR_TOKEN):
+            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    return await call_next(request)
+
+
+# CORS must stay permissive: the renderer is a file:// page, so every request to
+# this http://127.0.0.1 service is cross-origin (Origin: null). The access
+# boundary is the token above, not the origin — a page that lacks the token gets
+# 401 regardless of whether it could read the response.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 127.0.0.1-only service; renderer is a local file://
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # In-memory ingest job tracking (single-user desktop app).
 _jobs: dict[str, dict[str, Any]] = {}
+# Cap retained finished jobs so a long-lived process doesn't leak their (often
+# large) per-file status maps. Running jobs are never evicted.
+MAX_RETAINED_JOBS = 32
+
+
+def _register_job(job_id: str, job: dict[str, Any]) -> None:
+    _jobs[job_id] = job
+    finished = [jid for jid, j in _jobs.items() if j.get("status") == "done"]
+    for jid in finished[: max(0, len(finished) - MAX_RETAINED_JOBS)]:  # oldest first (insertion order)
+        _jobs.pop(jid, None)
 
 # ---------------------------------------------------------------------------
 # OpenAI spend tracking — measured token tallies, persisted per library.
@@ -61,7 +122,8 @@ _usage: dict[str, Any] = {"by_model": {}, "photos": 0}
 def _load_usage() -> None:
     global _usage
     try:
-        _usage = json.loads(_USAGE_FILE.read_text())
+        loaded = json.loads(_USAGE_FILE.read_text())
+        _usage = loaded if isinstance(loaded, dict) else {}  # tolerate a corrupt/non-dict file
     except Exception:
         _usage = {}
     _usage.setdefault("by_model", {})
@@ -94,17 +156,6 @@ def _estimated_cost() -> float:
         in_rate, out_rate = _price_for(model)
         total += tok["input"] / 1_000_000 * in_rate + tok["output"] / 1_000_000 * out_rate
     return total
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    await kc.startup()
-    _load_usage()
-
-
-@app.on_event("shutdown")
-async def _shutdown() -> None:
-    await kc.shutdown()
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +241,14 @@ def _custom(meta: dict[str, Any] | None) -> dict[str, Any]:
     return (meta or {}).get("custom", {}) or {}
 
 
+def _parse_uuid(doc_id: str) -> uuid.UUID:
+    """Parse a path-segment doc id, returning 404 (not an unhandled 500) if malformed."""
+    try:
+        return uuid.UUID(doc_id)
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(404, "not found")
+
+
 def _photo_dto(doc: Any, *, description: str | None = None, score: float | None = None) -> dict[str, Any]:
     """Map a Document or DocumentProjection to the gallery DTO (defensive getattr)."""
     meta = getattr(doc, "metadata", None) or {}
@@ -273,7 +332,7 @@ def _expand_paths(paths: list[str]) -> list[Path]:
 async def ingest(req: IngestRequest) -> dict[str, Any]:
     files = _expand_paths(req.paths)
     job_id = uuid.uuid4().hex
-    _jobs[job_id] = {
+    _register_job(job_id, {
         "total": len(files),
         "done": 0,
         "skipped": 0,
@@ -281,7 +340,7 @@ async def ingest(req: IngestRequest) -> dict[str, Any]:
         "status": "running",
         "errors": [],
         "items": {str(f): {"status": "pending"} for f in files},  # per-file status
-    }
+    })
     asyncio.create_task(_run_ingest(job_id, files))
     return {"job_id": job_id, "paths": [str(f) for f in files]}
 
@@ -393,7 +452,7 @@ async def rescan(req: RescanRequest) -> dict[str, Any]:
         for d in docs
     ]
     job_id = uuid.uuid4().hex
-    _jobs[job_id] = {"total": len(items), "done": 0, "skipped": 0, "failed": 0, "status": "running", "errors": []}
+    _register_job(job_id, {"total": len(items), "done": 0, "skipped": 0, "failed": 0, "status": "running", "errors": []})
     asyncio.create_task(_run_rescan(job_id, items, mode))
     return {"job_id": job_id, "total": len(items), "mode": mode}
 
@@ -545,6 +604,39 @@ def _py_match(
     return True
 
 
+def _rrf(rankings: list[tuple[list[str], float]], k: int = 60) -> list[tuple[str, float]]:
+    """Reciprocal-rank-fuse several ranked id lists into one ranking.
+
+    Each input is (ordered_ids, weight). A doc's score is the weighted sum of
+    1/(k+rank) across the lists it appears in, so docs ranked highly by *both*
+    vector recall and the entity graph rise to the top. Scale-free — no need to
+    reconcile cosine vs rank units. Returns (id, score) sorted best-first."""
+    scores: dict[str, float] = {}
+    for ids, weight in rankings:
+        for rank, key in enumerate(ids):
+            scores[key] = scores.get(key, 0.0) + weight / (k + rank)
+    return sorted(scores.items(), key=lambda kv: -kv[1])
+
+
+async def _entity_doc_ranking(q: str, ns: Any) -> list[str]:
+    """Rank document ids by the entity graph: find entities matching the query
+    (vector search over entity embeddings), then list the photos that are their
+    sources, best-matching-entity first."""
+    try:
+        ents = await kc.kb().search_entities(q, namespace=ns, limit=GRAPH_ENTITY_LIMIT, include_sources=True)
+    except Exception:
+        return []
+    order: list[str] = []
+    seen: set[str] = set()
+    for ent in ents:
+        for did in getattr(ent, "source_document_ids", None) or []:
+            key = str(did)
+            if key not in seen:
+                seen.add(key)
+                order.append(key)
+    return order
+
+
 @app.get("/gallery")
 async def gallery(limit: int = 500) -> dict[str, Any]:
     docs = await kc.kb().list_documents(namespace=kc.namespace(), limit=limit)
@@ -570,18 +662,57 @@ async def search(
 
     if q:
         flt = _build_filter(location, scene, objects, tags, date_from, date_to, city, country)
-        result = await kc.kb().recall(q, namespace=kc.namespace(), limit=limit, filter=flt)
-        docs = {d.id: d for d in result.documents}
-        photos: list[dict[str, Any]] = []
-        seen: set[Any] = set()
-        for ch in result.chunks:  # score-sorted; one photo == one document
-            if ch.document_id in seen:
-                continue
-            seen.add(ch.document_id)
-            doc = docs.get(ch.document_id)
-            if doc is not None:
-                photos.append(_photo_dto(doc, description=ch.content, score=ch.score))
-        return {"photos": photos, "mode": "semantic"}
+        # Relevance floor (MIN_SIMILARITY) keeps the result set to photos that
+        # actually relate to the query instead of returning the whole library
+        # ranked. Passed only when >0 so a 0 override restores "return all".
+        ns = kc.namespace()
+        recall_kwargs: dict[str, Any] = {}
+        if MIN_SIMILARITY > 0:
+            recall_kwargs["min_similarity"] = MIN_SIMILARITY
+        result = await kc.kb().recall(q, namespace=ns, limit=limit, filter=flt, **recall_kwargs)
+
+        # Recall ranking: one entry per document, chunks are score-sorted.
+        docs: dict[str, Any] = {str(d.id): d for d in result.documents}
+        chunk_for: dict[str, Any] = {}
+        recall_order: list[str] = []
+        for ch in result.chunks:
+            key = str(ch.document_id)
+            if key not in chunk_for:
+                chunk_for[key] = ch
+                recall_order.append(key)
+
+        # Graph leg: photos sharing an entity that matches the query, fused in.
+        graph_order = await _entity_doc_ranking(q, ns) if GRAPH_SEARCH else []
+        if graph_order:
+            fused = _rrf([(recall_order, 1.0), (graph_order, GRAPH_WEIGHT)])
+        else:
+            fused = [(key, 1.0 / (60 + i)) for i, key in enumerate(recall_order)]
+
+        # Display score = relative rank within the fused set (top = 1.0); the bar
+        # in the UI reads it as "ranked against the others", not absolute match.
+        hi = fused[0][1] if fused else 1.0
+        lo = fused[-1][1] if fused else 0.0
+        span = (hi - lo) or 1.0
+        mode = "semantic+graph" if graph_order else "semantic"
+
+        photos = []
+        for key, raw in fused:
+            doc = docs.get(key)
+            if doc is None:  # graph-only hit: not returned by recall, fetch it
+                try:
+                    doc = await kc.kb().get_document(uuid.UUID(key), namespace=ns)
+                except Exception:
+                    doc = None
+                if doc is None:
+                    continue
+                # graph-injected photos must still honour any active chip filters
+                if flt and not _py_match(_custom(getattr(doc, "metadata", None)), location, scene, objects, tags, date_from, date_to, city, country):
+                    continue
+            ch = chunk_for.get(key)
+            photos.append(_photo_dto(doc, description=ch.content if ch else None, score=(raw - lo) / span))
+            if len(photos) >= limit:
+                break
+        return {"photos": photos, "mode": mode}
 
     # Filter-only browse: enumerate all docs and match in Python (true "show all matching").
     docs_all = await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)
@@ -673,7 +804,7 @@ async def themes(limit_per_theme: int = 60) -> dict[str, Any]:
 async def related(doc_id: str, limit: int = 12) -> dict[str, Any]:
     from collections import Counter
 
-    target = uuid.UUID(doc_id)
+    target = _parse_uuid(doc_id)
     counts: Counter[Any] = Counter()
     for t in ENTITY_TYPES:
         for e in await kc.kb().list_entities(
@@ -696,7 +827,7 @@ async def related(doc_id: str, limit: int = 12) -> dict[str, Any]:
 
 @app.get("/photo/{doc_id}")
 async def photo(doc_id: str) -> dict[str, Any]:
-    doc = await kc.kb().get_document(uuid.UUID(doc_id), namespace=kc.namespace())
+    doc = await kc.kb().get_document(_parse_uuid(doc_id), namespace=kc.namespace())
     if doc is None:
         raise HTTPException(404, "not found")
     dto = _photo_dto(doc)
@@ -706,7 +837,7 @@ async def photo(doc_id: str) -> dict[str, Any]:
 
 @app.get("/image/{doc_id}")
 async def image(doc_id: str) -> FileResponse:
-    doc = await kc.kb().get_document(uuid.UUID(doc_id), namespace=kc.namespace())
+    doc = await kc.kb().get_document(_parse_uuid(doc_id), namespace=kc.namespace())
     if doc is None or not doc.source_url:
         raise HTTPException(404, "not found")
     p = Path(doc.source_url)

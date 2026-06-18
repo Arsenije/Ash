@@ -113,7 +113,9 @@ a { color: var(--fg); }
 .card img { width: 100%; height: 170px; object-fit: cover; display: block; }
 .card .meta { padding: 8px 10px; border-top: 1px solid var(--fg); }
 .card .meta .loc { font-size: 14px; opacity: .75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.card .score { position: absolute; top: 0; right: 0; background: var(--fg); color: var(--bg); padding: 2px 7px; font-size: 13px; }
+/* relative-match bar (semantic search): width = rank within these results */
+.card .relbar { position: absolute; left: 0; right: 0; top: 0; height: 3px; background: rgba(255, 255, 255, 0.25); }
+.card .relbar i { display: block; height: 100%; background: var(--fg); }
 .card.missing { opacity: .4; }
 
 /* ingest status badge (top-left) on optimistic cards */

@@ -2,6 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <!-- Lock the renderer down: only same-origin script/style, images from the
+         loopback sidecar (+ blob: for optimistic drag-drop previews), and
+         network only to the sidecar. No remote code, no inline script. -->
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self' data: blob: http://127.0.0.1:*; connect-src http://127.0.0.1:*" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Ash</title>
     <link rel="stylesheet" href="style.css" />
