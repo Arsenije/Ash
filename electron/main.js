@@ -293,6 +293,14 @@ function writeSwapConfig() {
     cfg += `  text:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("text", "main"))}\n`;
   }
   cfg += `  embed:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("embed", "main"))} --embedding\n`;
+  // Keep every active model co-resident (swap: false) instead of letting
+  // llama-swap evict one to load another. Ingest hits describe (vision) then
+  // embed back-to-back; swapping between them would kill an in-flight request
+  // ("upstream command exited prematurely"). They fit in RAM together.
+  const members = Object.keys(models)
+    .map((k) => `      - ${k}`)
+    .join("\n");
+  cfg += `groups:\n  ash:\n    swap: false\n    exclusive: false\n    members:\n${members}\n`;
   fs.writeFileSync(swapConfigPath, cfg);
 }
 
@@ -402,7 +410,11 @@ async function startSidecar() {
 
 // Bring up the full local stack: llama-swap (model server) then the sidecar.
 async function startServers() {
-  if (!loadEngine()) return; // nothing to run until the user sets up
+  // Don't start until the user has set up AND the chosen model is on disk and
+  // matches the catalog. This also routes an existing install whose configured
+  // model changed (e.g. SmolVLM2 -> Qwen2.5-VL) back through onboarding to
+  // download the new model, rather than starting on a stale/mismatched config.
+  if (!loadEngine() || !modelsPresent()) return;
   await startSwap();
   await startSidecar();
 }
