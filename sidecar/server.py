@@ -67,6 +67,16 @@ app.add_middleware(
 
 # In-memory ingest job tracking (single-user desktop app).
 _jobs: dict[str, dict[str, Any]] = {}
+# Cap retained finished jobs so a long-lived process doesn't leak their (often
+# large) per-file status maps. Running jobs are never evicted.
+MAX_RETAINED_JOBS = 32
+
+
+def _register_job(job_id: str, job: dict[str, Any]) -> None:
+    _jobs[job_id] = job
+    finished = [jid for jid, j in _jobs.items() if j.get("status") == "done"]
+    for jid in finished[: max(0, len(finished) - MAX_RETAINED_JOBS)]:  # oldest first (insertion order)
+        _jobs.pop(jid, None)
 
 # ---------------------------------------------------------------------------
 # OpenAI spend tracking — measured token tallies, persisted per library.
@@ -254,7 +264,7 @@ def _expand_paths(paths: list[str]) -> list[Path]:
 async def ingest(req: IngestRequest) -> dict[str, Any]:
     files = _expand_paths(req.paths)
     job_id = uuid.uuid4().hex
-    _jobs[job_id] = {
+    _register_job(job_id, {
         "total": len(files),
         "done": 0,
         "skipped": 0,
@@ -262,7 +272,7 @@ async def ingest(req: IngestRequest) -> dict[str, Any]:
         "status": "running",
         "errors": [],
         "items": {str(f): {"status": "pending"} for f in files},  # per-file status
-    }
+    })
     asyncio.create_task(_run_ingest(job_id, files))
     return {"job_id": job_id, "paths": [str(f) for f in files]}
 
@@ -365,7 +375,7 @@ async def rescan(req: RescanRequest) -> dict[str, Any]:
         for d in docs
     ]
     job_id = uuid.uuid4().hex
-    _jobs[job_id] = {"total": len(items), "done": 0, "skipped": 0, "failed": 0, "status": "running", "errors": []}
+    _register_job(job_id, {"total": len(items), "done": 0, "skipped": 0, "failed": 0, "status": "running", "errors": []})
     asyncio.create_task(_run_rescan(job_id, items, mode))
     return {"job_id": job_id, "total": len(items), "mode": mode}
 
