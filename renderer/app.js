@@ -8,6 +8,8 @@ const FIELDS = [
   { key: "tag", label: "tag", kind: "multi", facet: "tags", param: "tags" },
   { key: "after", label: "after", kind: "date", param: "date_from" },
   { key: "before", label: "before", kind: "date", param: "date_to" },
+  { key: "city", label: "city", kind: "single", facet: "cities", param: "city" },
+  { key: "country", label: "country", kind: "single", facet: "countries", param: "country" },
 ];
 
 const state = {
@@ -423,6 +425,8 @@ function renderGroups(photos, key) {
   const labelFor = (ph) => {
     if (key === "location") return ph.location || "No location";
     if (key === "scene") return ph.scene || "No scene";
+    if (key === "city") return ph.gps_city || "No city";
+    if (key === "country") return ph.gps_country || "No country";
     if (key === "date") return (ph.occurred_at || "").slice(0, 7) || "No date";
     return "Other";
   };
@@ -464,6 +468,15 @@ async function openDetail(id) {
   (ph.animals || []).forEach((a) => add("🐾 " + a));
   (ph.tags || []).forEach((t) => add("#" + t));
   if (ph.occurred_at) add("🕑 " + ph.occurred_at.slice(0, 10));
+  if (ph.gps_lat != null && ph.gps_lon != null) {
+    const gpsChip = el("div", "chip gps-chip");
+    const placeParts = [ph.gps_city, ph.gps_admin1, ph.gps_country].filter(Boolean);
+    gpsChip.textContent = "🌐 " + (placeParts.length ? placeParts.join(", ") : `${ph.gps_lat.toFixed(5)}, ${ph.gps_lon.toFixed(5)}`);
+    gpsChip.title = "Open in OpenStreetMap";
+    gpsChip.onclick = () =>
+      window.open(`https://www.openstreetmap.org/?mlat=${ph.gps_lat}&mlon=${ph.gps_lon}&zoom=15`);
+    attrs.appendChild(gpsChip);
+  }
   $("#d-reveal").onclick = () => window.api.reveal(ph.src);
 
   const rel = $("#d-related");
