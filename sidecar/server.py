@@ -29,6 +29,9 @@ from vision import describe_image
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
 INGEST_CONCURRENCY = 4
 THUMB_SIZE = (512, 512)
+# Relevance floor for semantic search (raw cosine). 0 = return everything up to
+# the limit (default). Tune per embedding model; see /search.
+MIN_SIMILARITY = float(os.environ.get("PHOTO_MIN_SIMILARITY", "0") or 0)
 
 app = FastAPI(title="photo-gallery sidecar")
 
@@ -516,7 +519,14 @@ async def search(
 
     if q:
         flt = _build_filter(location, scene, objects, tags, date_from, date_to)
-        result = await kc.kb().recall(q, namespace=kc.namespace(), limit=limit, filter=flt)
+        # Optional relevance floor (raw cosine, applied before khora normalizes
+        # the returned scores to a [0,1] rank). Off by default — the right value
+        # depends on the embedding model, so it's opt-in via PHOTO_MIN_SIMILARITY
+        # rather than a guessed default that might drop good matches.
+        recall_kwargs: dict[str, Any] = {}
+        if MIN_SIMILARITY > 0:
+            recall_kwargs["min_similarity"] = MIN_SIMILARITY
+        result = await kc.kb().recall(q, namespace=kc.namespace(), limit=limit, filter=flt, **recall_kwargs)
         docs = {d.id: d for d in result.documents}
         photos: list[dict[str, Any]] = []
         seen: set[Any] = set()

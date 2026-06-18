@@ -339,9 +339,15 @@ function renderGrid(photos, mode) {
     if (ph.thumb_url) img.src = mediaUrl(ph.thumb_url);
     card.appendChild(img);
     if (ph.score != null) {
-      const s = el("div", "score");
-      s.textContent = ph.score.toFixed(2);
-      card.appendChild(s);
+      // khora's score is a min-max-normalized rank *within this result set*
+      // (top match = 1, bottom = 0), not an absolute confidence. Showing the raw
+      // number implies a certainty it doesn't carry, so render a relative bar.
+      const bar = el("div", "relbar");
+      bar.title = "Relative match — ranked against the other results for this search";
+      const fill = el("i");
+      fill.style.width = Math.round(Math.max(0, Math.min(1, ph.score)) * 100) + "%";
+      bar.appendChild(fill);
+      card.appendChild(bar);
     }
     const meta = el("div", "meta");
     const loc = el("div", "loc");
