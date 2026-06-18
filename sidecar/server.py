@@ -15,6 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pycountry
 import reverse_geocoder as rg
 
 from fastapi import FastAPI, HTTPException, Query
@@ -162,7 +163,10 @@ def _reverse_geocode(lat: float, lon: float) -> dict[str, str]:
         results = rg.search((lat, lon), verbose=False)
         if results:
             r = results[0]
-            return {"gps_city": r.get("name", ""), "gps_admin1": r.get("admin1", ""), "gps_country": r.get("cc", "")}
+            cc = r.get("cc", "")
+            c = pycountry.countries.get(alpha_2=cc)
+            country = c.name if c else cc
+            return {"gps_city": r.get("name", ""), "gps_admin1": r.get("admin1", ""), "gps_country": country}
     except Exception:
         pass
     return {}

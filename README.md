@@ -89,7 +89,7 @@ Three local models do the work, all downloaded once (~3.5 GB): **SmolVLM2 2.2B**
 ```bash
 npm run binaries                                        # llama.cpp + llama-swap for this OS/arch
 cd sidecar && uv venv --python 3.13 .venv \             # python sidecar
-  && uv pip install --python .venv/bin/python "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart reverse_geocoder && cd ..
+  && uv pip install --python .venv/bin/python "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart reverse_geocoder pycountry && cd ..
 npm install                                             # electron deps
 npm start                                               # run
 ```
