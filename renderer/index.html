@@ -205,6 +205,22 @@
         </div>
         <p class="hint">Re-describe re-runs the vision model on every photo. Re-extract only rebuilds the connections from existing descriptions — faster, good after a model change.</p>
         <div id="info-rescan-status" class="hint"></div>
+
+        <div class="onb-h info-h">Immich</div>
+        <p class="hint">Pull photos from a self-hosted Immich server into your local library. Originals are downloaded and kept on this machine, then described and searchable like any other photo.</p>
+        <div class="info-row">
+          <input id="immich-url" class="immich-input" type="url" placeholder="https://immich.example.com" autocomplete="off" spellcheck="false" />
+        </div>
+        <div class="info-row">
+          <input id="immich-key" class="immich-input" type="password" placeholder="API key" autocomplete="off" />
+          <button id="immich-test" class="btn small">Connect</button>
+        </div>
+        <label class="immich-check"><input id="immich-verify" type="checkbox" checked /> Verify TLS certificate</label>
+        <select id="immich-albums" class="immich-albums" multiple size="5" disabled></select>
+        <div class="info-row">
+          <button id="immich-import" class="btn small" disabled>Import selected albums</button>
+        </div>
+        <div id="immich-status" class="hint"></div>
       </div>
     </div>
 

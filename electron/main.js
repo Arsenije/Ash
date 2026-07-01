@@ -1,6 +1,6 @@
 "use strict";
 
-const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require("electron");
 const { spawn } = require("node:child_process");
 
 app.setName("Ash");
@@ -77,6 +77,54 @@ function loadEngine() {
 function saveEngine(engine) {
   const s = readSettings();
   s.engine = engine;
+  writeSettings(s);
+}
+
+// Immich connection (server URL + API key). The key is a credential, so encrypt
+// it with the OS keychain (safeStorage) when available; fall back to plaintext in
+// the already-mode-0600 settings file if the platform has no encryption backend.
+function encryptSecret(plain) {
+  if (plain && safeStorage.isEncryptionAvailable()) {
+    return { enc: safeStorage.encryptString(plain).toString("base64") };
+  }
+  return { plain: plain || "" };
+}
+
+function decryptSecret(stored) {
+  if (!stored) return "";
+  if (stored.enc) {
+    try {
+      return safeStorage.decryptString(Buffer.from(stored.enc, "base64"));
+    } catch {
+      return "";
+    }
+  }
+  return stored.plain || "";
+}
+
+function loadImmich() {
+  const im = readSettings().immich;
+  if (!im) return null;
+  return {
+    baseUrl: im.baseUrl || "",
+    apiKey: decryptSecret(im.apiKey),
+    verifyTls: im.verifyTls !== false, // default true
+  };
+}
+
+function saveImmich(cfg) {
+  const s = readSettings();
+  s.immich = {
+    baseUrl: (cfg && cfg.baseUrl) || "",
+    apiKey: encryptSecret(cfg && cfg.apiKey),
+    verifyTls: !(cfg && cfg.verifyTls === false),
+  };
+  writeSettings(s);
+}
+
+function clearImmich() {
+  const s = readSettings();
+  delete s.immich;
   writeSettings(s);
 }
 
@@ -386,6 +434,17 @@ ipcMain.handle("download-models", async (e) => {
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
   }
+});
+
+// Immich connection settings (persisted; the API key is encrypted at rest).
+ipcMain.handle("immich-get", async () => loadImmich());
+ipcMain.handle("immich-save", async (_e, cfg) => {
+  saveImmich(cfg);
+  return { ok: true };
+});
+ipcMain.handle("immich-clear", async () => {
+  clearImmich();
+  return { ok: true };
 });
 
 ipcMain.handle("pick-paths", async () => {
