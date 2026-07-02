@@ -52,6 +52,16 @@ if [ ! -d node_modules ]; then
 fi
 
 say "Setup complete."
+
+# --- 4. macOS launcher app (Spotlight / Raycast) ---------------------------
+# Drop a tiny Ash.app into ~/Applications so Ash is searchable and clickable.
+# Non-fatal: never let a failure here abort setup.
+if [ "$(uname)" = "Darwin" ]; then
+  if node scripts/make-macos-app.mjs; then
+    say "Added Ash to ~/Applications — search \"Ash\" in Spotlight or Raycast."
+  fi
+fi
+
 if [ "${ASH_NO_LAUNCH:-}" != "1" ]; then
   say "Launching Ash… (next time, just run: npm start)"
   npm start
