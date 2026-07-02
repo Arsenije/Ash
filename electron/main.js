@@ -1,7 +1,7 @@
 "use strict";
 
 const { app, BrowserWindow, ipcMain, dialog, shell, safeStorage } = require("electron");
-const { spawn } = require("node:child_process");
+const { spawn, execFileSync } = require("node:child_process");
 
 app.setName("Ash");
 const crypto = require("node:crypto");
@@ -39,24 +39,73 @@ let settingsPath = "";
 // llama-swap model ids (what the sidecar/khora address) → how to fetch + serve.
 //   role "main" is the GGUF; vision also needs an "mmproj" projector GGUF.
 // repo/quant feed a HuggingFace API lookup so we don't hard-code filenames.
-const MODELS = {
-  vision: { label: "SmolVLM2 2.2B", repo: "ggml-org/SmolVLM2-2.2B-Instruct-GGUF", quant: "Q4_K_M", mmproj: true },
-  embed: { label: "Nomic Embed", repo: "nomic-ai/nomic-embed-text-v1.5-GGUF", quant: "Q4_K_M" },
-  // Qwen2.5-3B (not a 1B) — entity extraction needs a model that emits a single
-  // clean JSON object; 1B models wrap it in prose/fences and khora drops it.
-  text: { label: "Qwen2.5 3B", repo: "bartowski/Qwen2.5-3B-Instruct-GGUF", quant: "Q4_K_M" },
-};
+// User-selectable vision-language model. The chosen one describes each photo AND
+// serves as khora's entity-extraction model — except the lightweight option,
+// which pairs a tiny VLM with a separate text model (tiny VLMs can't emit the
+// clean extraction JSON khora needs). Embeddings are fixed (nomic, 768-dim).
+const MODEL_CHOICES = [
+  {
+    id: "qwen-vl-3b",
+    label: "Qwen2.5-VL 3B",
+    size: "~2.2 GB",
+    blurb: "Recommended. One model describes photos and finds connections; good at reading text. Runs on 8 GB.",
+    vision: { repo: "ggml-org/Qwen2.5-VL-3B-Instruct-GGUF", quant: "Q4_K_M", mmproj: true },
+  },
+  {
+    id: "qwen-vl-7b",
+    label: "Qwen2.5-VL 7B",
+    size: "~5.5 GB",
+    blurb: "Best quality, especially on text-heavy or complex photos. Needs ~8–10 GB of free memory.",
+    vision: { repo: "ggml-org/Qwen2.5-VL-7B-Instruct-GGUF", quant: "Q4_K_M", mmproj: true },
+  },
+  {
+    id: "smolvlm2-light",
+    label: "SmolVLM2 2.2B (light)",
+    size: "~3.5 GB",
+    blurb: "Smallest and fastest; weaker at reading text. Pairs with a small text model for connections.",
+    vision: { repo: "ggml-org/SmolVLM2-2.2B-Instruct-GGUF", quant: "Q4_K_M", mmproj: true },
+    text: { repo: "bartowski/Qwen2.5-3B-Instruct-GGUF", quant: "Q4_K_M" },
+  },
+];
+const DEFAULT_CHOICE = "qwen-vl-3b";
+const EMBED = { repo: "nomic-ai/nomic-embed-text-v1.5-GGUF", quant: "Q4_K_M" };
+
+function choiceById(id) {
+  return MODEL_CHOICES.find((c) => c.id === id) || MODEL_CHOICES.find((c) => c.id === DEFAULT_CHOICE);
+}
+
+function selectedChoiceId() {
+  return readSettings().model_choice || DEFAULT_CHOICE;
+}
+
+// The model slots to download/serve for a choice. "vision" always (also does
+// extraction unless the choice defines a separate "text" model); "embed" always.
+function activeModels(id = selectedChoiceId()) {
+  const c = choiceById(id);
+  const models = {
+    vision: { label: c.label, mmproj: false, ...c.vision },
+    embed: { label: "Nomic Embed", mmproj: false, ...EMBED },
+  };
+  if (c.text) models.text = { label: `${c.label} (text)`, mmproj: false, ...c.text };
+  return models;
+}
+
+// Engine record persisted to settings; text_model points at the separate text
+// model only when the chosen VLM doesn't cover extraction itself.
+function engineRecordFor(id) {
+  const c = choiceById(id);
+  return {
+    provider: "local",
+    vision_model: "vision",
+    text_model: c.text ? "text" : "vision",
+    embed_model: "embed",
+    embed_dim: 768, // nomic-embed-text-v1.5
+    model_choice: c.id,
+  };
+}
 
 // The engine record persisted to settings. base_url is resolved at runtime from
 // the live llama-swap port, so it isn't stored here.
-const LOCAL_ENGINE = {
-  provider: "local",
-  vision_model: "vision",
-  text_model: "text",
-  embed_model: "embed",
-  embed_dim: 768, // nomic-embed-text-v1.5
-};
-
 function readSettings() {
   try {
     return JSON.parse(fs.readFileSync(settingsPath, "utf8"));
@@ -72,12 +121,6 @@ function writeSettings(obj) {
 // The configured engine, or null when the user hasn't set up yet (first run).
 function loadEngine() {
   return readSettings().engine || null;
-}
-
-function saveEngine(engine) {
-  const s = readSettings();
-  s.engine = engine;
-  writeSettings(s);
 }
 
 // Immich connection (server URL + API key). The key is a credential, so encrypt
@@ -186,9 +229,26 @@ function modelPath(key, role) {
   return path.join(modelsDir, role === "mmproj" ? `${key}-mmproj.gguf` : `${key}.gguf`);
 }
 
-function modelsPresent() {
-  return Object.entries(MODELS).every(
-    ([key, m]) => fs.existsSync(modelPath(key, "main")) && (!m.mmproj || fs.existsSync(modelPath(key, "mmproj")))
+// Records which repo each on-disk model file came from, so changing a model in
+// MODELS (e.g. SmolVLM2 -> Qwen2.5-VL) re-downloads it instead of silently
+// serving the stale file that happens to share the same filename.
+function modelManifest() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(modelsDir, "models.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function writeManifest(man) {
+  fs.writeFileSync(path.join(modelsDir, "models.json"), JSON.stringify(man));
+}
+
+function modelsPresent(id = selectedChoiceId()) {
+  const man = modelManifest();
+  return Object.entries(activeModels(id)).every(
+    ([key, m]) =>
+      man[key] === m.repo && fs.existsSync(modelPath(key, "main")) && (!m.mmproj || fs.existsSync(modelPath(key, "mmproj")))
   );
 }
 
@@ -242,20 +302,24 @@ async function downloadTo(url, dest, onProgress) {
 }
 
 // Download every model (skipping ones already on disk), reporting progress.
-async function downloadModels(onProgress) {
+async function downloadModels(id, onProgress) {
   fs.mkdirSync(modelsDir, { recursive: true });
-  for (const [key, m] of Object.entries(MODELS)) {
+  const man = modelManifest();
+  for (const [key, m] of Object.entries(activeModels(id))) {
+    const stale = man[key] !== m.repo; // model identity changed -> re-fetch over the old file
     const jobs = [{ role: "main", label: m.label }];
     if (m.mmproj) jobs.push({ role: "mmproj", label: `${m.label} (vision projector)` });
     for (const job of jobs) {
       const dest = modelPath(key, job.role);
-      if (fs.existsSync(dest) && fs.statSync(dest).size > 0) continue; // already have it
+      if (!stale && fs.existsSync(dest) && fs.statSync(dest).size > 0) continue; // already have it
       const file = await resolveHfFile(m.repo, m.quant, { mmproj: job.role === "mmproj" });
       if (!file) throw new Error(`no ${job.role} GGUF found in ${m.repo}`);
       onProgress({ model: job.label, fraction: 0 });
       await downloadTo(hfUrl(m.repo, file), dest, (f) => onProgress({ model: job.label, fraction: f }));
       onProgress({ model: job.label, fraction: 1 });
     }
+    man[key] = m.repo;
+    writeManifest(man);
   }
 }
 
@@ -267,26 +331,77 @@ function writeSwapConfig() {
   const q = (p) => `"${p}"`;
   // cmd is a YAML block scalar (|) so the quoted paths aren't parsed as YAML.
   // ${PORT} is llama-swap's macro (assigned per backend) — keep it literal.
-  const cfg = `models:
-  vision:
-    ttl: 300
-    cmd: |
-      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("vision", "main"))} --mmproj ${q(modelPath("vision", "mmproj"))}
-  embed:
-    ttl: 300
-    cmd: |
-      ${q(server)} --host 127.0.0.1 --port \${PORT} -m ${q(modelPath("embed", "main"))} --embedding
-  text:
-    ttl: 300
-    cmd: |
-      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("text", "main"))}
-`;
+  const models = activeModels();
+  // The vision model also serves khora's text extraction, so it needs --jinja
+  // (its chat template) and handles both image and text-only requests on one
+  // backend. A separate "text" block is emitted only for the lightweight choice.
+  let cfg = "models:\n";
+  cfg += `  vision:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("vision", "main"))} --mmproj ${q(modelPath("vision", "mmproj"))}\n`;
+  if (models.text) {
+    cfg += `  text:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("text", "main"))}\n`;
+  }
+  // Embed runs CPU-only (-ngl 0): tiny (~80MB), negligible latency, and off Metal
+  // so it can't contend with the GPU-heavy vision model. Batch/context are raised
+  // to nomic's full 2048 (llama-server otherwise auto-caps n_batch at 512 and
+  // returns HTTP 500 on any input >512 tokens — "input too large to process").
+  cfg += `  embed:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} -ngl 0 -c 2048 -b 2048 -ub 2048 -m ${q(modelPath("embed", "main"))} --embedding\n`;
+  // Keep every active model co-resident (swap: false) instead of letting
+  // llama-swap evict one to load another. Ingest hits describe (vision) then
+  // embed back-to-back; swapping between them would kill an in-flight request
+  // ("upstream command exited prematurely"). They fit in RAM together.
+  const members = Object.keys(models)
+    .map((k) => `      - ${k}`)
+    .join("\n");
+  cfg += `groups:\n  ash:\n    swap: false\n    exclusive: false\n    members:\n${members}\n`;
   fs.writeFileSync(swapConfigPath, cfg);
+}
+
+// Kill a spawned process AND its children. On POSIX we spawn detached (the child
+// is its own process-group leader), so signalling the negative pid reaps the
+// whole group — e.g. llama-swap plus every llama-server backend it spawned — so
+// quitting never leaves orphaned model servers running.
+function killTree(proc, signal = "SIGTERM") {
+  if (!proc || proc.killed) return;
+  try {
+    if (process.platform === "win32") proc.kill(signal);
+    else process.kill(-proc.pid, signal);
+  } catch {
+    /* already exited */
+  }
+}
+
+// Reap llama-swap / llama-server processes left over from a previous session that
+// didn't shut down cleanly (a crash or force-quit skips before-quit, so killTree
+// never ran). Matched by our own config + models paths, so unrelated llama
+// processes are never touched. Run once at startup before spawning fresh ones —
+// accumulated orphans each hold GPU/unified memory and would starve the new
+// session's models (the embed-server starvation we saw).
+function reapOrphans() {
+  if (process.platform === "win32") return; // pgrep is POSIX-only; Windows reap TODO
+  const pids = new Set();
+  for (const needle of [swapConfigPath, modelsDir].filter(Boolean)) {
+    try {
+      for (const line of execFileSync("pgrep", ["-f", needle], { encoding: "utf8" }).split("\n")) {
+        const pid = Number.parseInt(line, 10);
+        if (pid && pid !== process.pid) pids.add(pid);
+      }
+    } catch {
+      /* pgrep exits 1 when nothing matches */
+    }
+  }
+  for (const pid of pids) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+  if (pids.size) console.log(`reaped ${pids.size} orphaned runtime process(es) from a previous session`);
 }
 
 function stopSwap() {
   if (llamaSwap) {
-    llamaSwap.kill();
+    killTree(llamaSwap);
     llamaSwap = null;
   }
 }
@@ -299,6 +414,7 @@ async function startSwap() {
   writeSwapConfig();
   llamaSwap = spawn(swap, ["--config", swapConfigPath, "--listen", `127.0.0.1:${swapPort}`], {
     stdio: ["ignore", "pipe", "pipe"],
+    detached: process.platform !== "win32", // own process group, so killTree reaps its llama-server children
   });
   llamaSwap.stdout.on("data", (d) => process.stdout.write(`[swap] ${d}`));
   llamaSwap.stderr.on("data", (d) => process.stderr.write(`[swap] ${d}`));
@@ -354,7 +470,7 @@ async function waitForUrl(url, timeoutMs = 30000) {
 
 function stopSidecar() {
   if (sidecar) {
-    sidecar.kill();
+    killTree(sidecar);
     sidecar = null;
   }
 }
@@ -377,7 +493,7 @@ async function startSidecar() {
   sidecar = spawn(
     PY,
     ["-m", "uvicorn", "server:app", "--host", "127.0.0.1", "--port", String(sidecarPort), "--log-level", "warning"],
-    { cwd: SIDECAR_DIR, env, stdio: ["ignore", "pipe", "pipe"] }
+    { cwd: SIDECAR_DIR, env, stdio: ["ignore", "pipe", "pipe"], detached: process.platform !== "win32" }
   );
   sidecar.stdout.on("data", (d) => process.stdout.write(`[sidecar] ${d}`));
   sidecar.stderr.on("data", (d) => process.stderr.write(`[sidecar] ${d}`));
@@ -390,7 +506,11 @@ async function startSidecar() {
 
 // Bring up the full local stack: llama-swap (model server) then the sidecar.
 async function startServers() {
-  if (!loadEngine()) return; // nothing to run until the user sets up
+  // Don't start until the user has set up AND the chosen model is on disk and
+  // matches the catalog. This also routes an existing install whose configured
+  // model changed (e.g. SmolVLM2 -> Qwen2.5-VL) back through onboarding to
+  // download the new model, rather than starting on a stale/mismatched config.
+  if (!loadEngine() || !modelsPresent()) return;
   await startSwap();
   await startSidecar();
 }
@@ -406,6 +526,8 @@ async function engineStatus() {
     token: sidecarToken,
     ready: Boolean(engine) && sidecarPort > 0,
     runtime: { available: runtimeAvailable(), modelsReady: modelsPresent() },
+    models: MODEL_CHOICES.map((c) => ({ id: c.id, label: c.label, size: c.size, blurb: c.blurb })),
+    selectedModel: selectedChoiceId(),
     hardware: hardwareTier(),
     version: app.getVersion(),
   };
@@ -415,8 +537,12 @@ ipcMain.handle("get-config", async () => engineStatus());
 ipcMain.handle("engine-status", async () => engineStatus());
 
 // Set up the local engine and bring the stack up on it.
-ipcMain.handle("engine-set", async () => {
-  saveEngine({ ...LOCAL_ENGINE });
+ipcMain.handle("engine-set", async (_e, choiceId) => {
+  const id = choiceById(choiceId).id; // validate / fall back to default
+  const s = readSettings();
+  s.model_choice = id;
+  s.engine = engineRecordFor(id);
+  writeSettings(s);
   try {
     await startServers();
   } catch (err) {
@@ -426,10 +552,11 @@ ipcMain.handle("engine-set", async () => {
 });
 
 // Download the model GGUFs from HuggingFace, forwarding progress to the renderer.
-ipcMain.handle("download-models", async (e) => {
+ipcMain.handle("download-models", async (e, choiceId) => {
+  const id = choiceById(choiceId).id;
   const send = (p) => e.sender.send("model-download-progress", p);
   try {
-    await downloadModels(send);
+    await downloadModels(id, send);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -492,6 +619,7 @@ app.whenReady().then(async () => {
   swapConfigPath = path.join(userData, "llama-swap.yaml");
   settingsPath = path.join(userData, "settings.json");
   fs.mkdirSync(dataDir, { recursive: true });
+  reapOrphans(); // clear runtime processes orphaned by a previous crash/force-quit before starting fresh
 
   app.setAboutPanelOptions({ applicationName: "Ash", applicationVersion: app.getVersion() });
   if (process.platform === "darwin" && app.dock && fs.existsSync(ICON)) app.dock.setIcon(ICON);

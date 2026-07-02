@@ -5,9 +5,10 @@ const { contextBridge, ipcRenderer, webUtils } = require("electron");
 contextBridge.exposeInMainWorld("api", {
   getConfig: () => ipcRenderer.invoke("get-config"),
   engineStatus: () => ipcRenderer.invoke("engine-status"),
-  engineSet: () => ipcRenderer.invoke("engine-set"),
-  // Download the model GGUFs; progress arrives via onModelProgress until it resolves.
-  downloadModels: () => ipcRenderer.invoke("download-models"),
+  // Configure + start the stack on the chosen model (id from getConfig().models).
+  engineSet: (choiceId) => ipcRenderer.invoke("engine-set", choiceId),
+  // Download the chosen model's GGUFs; progress arrives via onModelProgress until it resolves.
+  downloadModels: (choiceId) => ipcRenderer.invoke("download-models", choiceId),
   onModelProgress: (cb) => {
     const handler = (_e, p) => cb(p);
     ipcRenderer.on("model-download-progress", handler);

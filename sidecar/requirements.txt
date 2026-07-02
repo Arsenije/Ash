@@ -1,5 +1,5 @@
-# Sidecar deps. khora is installed from the local worktree with the embedded extra:
-#   uv pip install "khora[embedded] @ file:///Users/kumiko/conductor/workspaces/khora-v1/khora-photo-app"
+# Sidecar Python deps, installed by scripts/setup.sh and setup.ps1.
+# khora is installed separately with the embedded extra: uv pip install "khora[embedded]"
 fastapi
 uvicorn[standard]
 openai

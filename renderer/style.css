@@ -224,6 +224,19 @@ h2, h3 { font-weight: 600; }
 .onb-m-sub { font-size: 13px; opacity: .7; margin-top: 3px; }
 .onb-included { opacity: .7; }
 .onb-h-gap { margin-top: 22px; }
+
+/* selectable model choices (onboarding) */
+.onb-choices { border: 1px solid var(--fg); margin-bottom: 10px; }
+.onb-choice { padding: 12px 14px; border-top: 1px solid var(--fg); cursor: pointer; }
+.onb-choice:first-child { border-top: none; }
+.onb-choice:hover { background: rgba(255, 255, 255, 0.06); }
+.onb-choice.active { background: var(--fg); color: var(--bg); }
+.onb-choice-top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+.onb-choice-top b { font-size: 15px; }
+.onb-choice-size { font-size: 13px; opacity: .55; white-space: nowrap; }
+.onb-choice.active .onb-choice-size { opacity: .75; }
+.onb-choice-blurb { font-size: 13px; opacity: .7; margin-top: 4px; }
+.onb-choice.active .onb-choice-blurb { opacity: .85; }
 .onb-primary { width: 100%; padding: 14px; font-size: 16px; }
 .onb-link {
   display: inline-block; margin-top: 22px; background: transparent; border: none;

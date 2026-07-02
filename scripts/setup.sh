@@ -42,7 +42,7 @@ if [ ! -e sidecar/.venv/bin/python ]; then
   say "Creating the Python 3.13 sidecar environment…"
   uv venv --python 3.13 sidecar/.venv
   uv pip install --python sidecar/.venv/bin/python \
-    "khora[embedded]" fastapi "uvicorn[standard]" openai httpx pillow pillow-heif python-multipart
+    "khora[embedded]" -r sidecar/requirements.txt
 fi
 
 # --- 3. electron dependencies ----------------------------------------------
