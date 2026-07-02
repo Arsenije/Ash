@@ -26,11 +26,19 @@ from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image, ImageOps
 from pydantic import BaseModel
 
+try:  # optional: lets PIL open HEIC/HEIF, common for iPhone photos pulled from Immich
+    from pillow_heif import register_heif_opener
+
+    register_heif_opener()
+except Exception:  # pillow-heif absent — HEIC assets will simply land in a job's "failed" list
+    pass
+
+import immich_client
 import khora_client as kc
 from expertise import ENTITY_TYPES, PHOTO_EXPERTISE, RELATIONSHIP_TYPES
 from vision import describe_image
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".heic", ".heif"}
 INGEST_CONCURRENCY = 2  # one heavy VL doing describe+extract; 2 keeps the queue from backing up
 THUMB_SIZE = (512, 512)
 
@@ -377,6 +385,89 @@ async def ingest_status(job_id: str) -> dict[str, Any]:
     return job
 
 
+# Sentinel: tells _process_photo "no value was passed, extract locally" — distinct
+# from an explicit None, which means "the caller knows there is no value" (e.g. an
+# Immich asset whose EXIF carries no GPS: don't re-probe the file for it).
+_UNSET: Any = object()
+
+
+async def _process_photo(
+    path: Path,
+    *,
+    existing: set[str],
+    prefetched_gps: tuple[float, float] | None = _UNSET,
+    prefetched_geo: dict[str, str] | None = None,
+    prefetched_dt: datetime | None = None,
+    extra_meta: dict[str, Any] | None = None,
+    title: str | None = None,
+) -> dict[str, Any]:
+    """Hash-dedup, describe, thumbnail, and remember one on-disk image.
+
+    Returns a job-item dict: ``{"status": "skipped"|"done", "ext_id", "doc_id"?}``.
+    Raises on failure so the caller records it. Shared by drag-drop ingest and
+    Immich import; the caller owns the per-item ``job`` bookkeeping because the
+    item key differs (filesystem path vs. Immich asset id).
+
+    ``prefetched_*`` let a caller supply already-known metadata (e.g. Immich's
+    server-side EXIF) to skip the local probes. ``extra_meta`` is merged into
+    ``metadata.custom`` (e.g. ``immich_asset_id``). ``title`` overrides the
+    document title / stored filename (defaults to ``path.name``).
+    """
+    ext_id = _hash_file(path)
+    if ext_id in existing:
+        return {"status": "skipped", "ext_id": ext_id}
+    dt = prefetched_dt or _photo_datetime(path)
+    gps = _photo_gps(path) if prefetched_gps is _UNSET else prefetched_gps
+    if prefetched_geo is not None:
+        geo = prefetched_geo
+    else:
+        geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
+    desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
+    _record_usage(vusage["model"], vusage["input"], vusage["output"])
+    await asyncio.to_thread(_make_thumbnail, path, ext_id)
+    place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country"), geo.get("gps_country_code")]
+    place_suffix = ", ".join(p for p in place_parts if p)
+    base_content = desc["description"] or f"Photo: {path.name}"
+    content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
+    name = title or path.name
+    custom = {
+        "location": desc["location"],
+        "objects": desc["objects"],
+        "animals": desc["animals"],
+        "scene": desc["scene"],
+        "tags": desc["tags"],
+        "occurred_at": dt.isoformat(),
+        "filename": name,
+        "gps_lat": gps[0] if gps else None,
+        "gps_lon": gps[1] if gps else None,
+        **geo,
+    }
+    if extra_meta:
+        custom.update(extra_meta)
+    result = await asyncio.wait_for(
+        kc.kb().remember(
+            content=content,
+            namespace=kc.namespace(),
+            title=name,
+            source_type="photo",
+            source_url=str(path.resolve()),
+            source_timestamp=dt,
+            external_id=ext_id,
+            metadata={"custom": custom},
+            entity_types=ENTITY_TYPES,
+            relationship_types=RELATIONSHIP_TYPES,
+            expertise=PHOTO_EXPERTISE,
+        ),
+        REMEMBER_TIMEOUT_S,
+    )
+    for u in result.llm_usage:  # extraction + embedding tokens from khora
+        _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
+    _usage["photos"] += 1
+    _persist_usage()
+    existing.add(ext_id)
+    return {"status": "done", "ext_id": ext_id, "doc_id": str(result.document_id)}
+
+
 async def _run_ingest(job_id: str, files: list[Path]) -> None:
     job = _jobs[job_id]
     # Idempotency: external_id == file content hash; skip already-ingested files.
@@ -393,62 +484,13 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                 return
             try:
                 job["items"][key] = {"status": "scanning"}
-                ext_id = _hash_file(path)
-                if ext_id in existing:
+                item = await _process_photo(path, existing=existing)
+                if item["status"] == "skipped":
                     job["skipped"] += 1
-                    job["items"][key] = {"status": "skipped", "ext_id": ext_id}
-                    return
-                dt = _photo_datetime(path)
-                gps = _photo_gps(path)
-                geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
-                desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
-                _record_usage(vusage["model"], vusage["input"], vusage["output"])
-                await asyncio.to_thread(_make_thumbnail, path, ext_id)
-                place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country"), geo.get("gps_country_code")]
-                place_suffix = ", ".join(p for p in place_parts if p)
-                base_content = desc["description"] or f"Photo: {path.name}"
-                content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
-                result = await asyncio.wait_for(
-                    kc.kb().remember(
-                        content=content,
-                        namespace=kc.namespace(),
-                        title=path.name,
-                        source_type="photo",
-                        source_url=str(path.resolve()),
-                        source_timestamp=dt,
-                        external_id=ext_id,
-                        metadata={
-                            "custom": {
-                                "location": desc["location"],
-                                "objects": desc["objects"],
-                                "animals": desc["animals"],
-                                "scene": desc["scene"],
-                                "tags": desc["tags"],
-                                "occurred_at": dt.isoformat(),
-                                "filename": path.name,
-                                "gps_lat": gps[0] if gps else None,
-                                "gps_lon": gps[1] if gps else None,
-                                **geo,
-                            }
-                        },
-                        entity_types=ENTITY_TYPES,
-                        relationship_types=RELATIONSHIP_TYPES,
-                        expertise=PHOTO_EXPERTISE,
-                    ),
-                    REMEMBER_TIMEOUT_S,
-                )
-                for u in result.llm_usage:  # extraction + embedding tokens from khora
-                    _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
-                _usage["photos"] += 1
-                _persist_usage()
-                existing.add(ext_id)
-                job["done"] += 1
-                job["items"][key] = {
-                    "status": "done",
-                    "ext_id": ext_id,
-                    "doc_id": str(result.document_id),
-                }
-                breaker.ok()
+                else:
+                    job["done"] += 1
+                    breaker.ok()  # a real success clears the failure streak
+                job["items"][key] = item
             except Exception as exc:  # keep the batch going; record the failure
                 msg = "timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
                 job["failed"] += 1
@@ -461,6 +503,242 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
     job["status"] = "done"  # 'done' so the renderer stops polling; aborted flag/errors convey the failure
     if breaker.tripped:
         job["aborted"] = True
+
+
+# ---------------------------------------------------------------------------
+# Immich import — pull photos from a self-hosted Immich server into the local
+# library. Reuses _process_photo (and so the ingest job/polling machinery); the
+# only Immich-specific work is enumerating + downloading originals and mapping
+# Immich's server-side EXIF onto Ash's fields.
+# ---------------------------------------------------------------------------
+_MIME_EXT = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+    "image/bmp": ".bmp",
+    "image/tiff": ".tiff",
+    "image/heic": ".heic",
+    "image/heif": ".heic",
+}
+
+
+class ImmichCreds(BaseModel):
+    base_url: str
+    api_key: str
+    verify_tls: bool = True
+
+
+class ImmichImportRequest(ImmichCreds):
+    album_ids: list[str]
+
+
+def _version_str(info: dict[str, Any]) -> str:
+    """A display version from /server/about (a string) or /server/version (parts)."""
+    v = info.get("version")
+    if isinstance(v, str):
+        return v
+    if all(k in info for k in ("major", "minor", "patch")):
+        return f"{info['major']}.{info['minor']}.{info['patch']}"
+    return ""
+
+
+def _safe_asset_id(asset_id: str) -> str:
+    """Immich asset ids are UUIDs; keep only filesystem-safe characters anyway."""
+    return "".join(ch for ch in asset_id if ch.isalnum() or ch == "-")
+
+
+def _ext_for(asset: dict[str, Any]) -> str:
+    """File extension for a downloaded original: the original filename's suffix,
+    else a MIME-type mapping, else .jpg."""
+    suffix = Path(asset.get("originalFileName") or "").suffix.lower()
+    if suffix:
+        return suffix
+    return _MIME_EXT.get((asset.get("originalMimeType") or "").lower(), ".jpg")
+
+
+def _country_code(country: str) -> str:
+    """Best-effort ISO alpha-2 for a country NAME — Immich reports the name, not
+    the code (Ash's local path stores both)."""
+    if not country:
+        return ""
+    try:
+        matches = pycountry.countries.search_fuzzy(country)  # raises LookupError on no match
+        if matches:
+            return matches[0].alpha_2
+    except Exception:
+        pass
+    return ""
+
+
+def _parse_iso_utc(raw: str) -> datetime | None:
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt.replace(tzinfo=UTC) if dt.tzinfo is None else dt.astimezone(UTC)
+
+
+def _immich_meta(asset: dict[str, Any]) -> tuple[Any, dict[str, str] | None, datetime | None]:
+    """Map an Immich asset's server-side EXIF onto _process_photo's (gps, geo, dt)
+    inputs. When Immich supplied ``exifInfo`` we prefer it wholesale (skipping the
+    local probes); when it didn't we return ``_UNSET``/``None`` so _process_photo
+    falls back to reading the downloaded file."""
+    exif = asset.get("exifInfo")
+    if not exif:
+        return _UNSET, None, None
+    lat, lon = exif.get("latitude"), exif.get("longitude")
+    gps = (float(lat), float(lon)) if lat is not None and lon is not None else None
+    country = exif.get("country") or ""
+    geo = {
+        "gps_city": exif.get("city") or "",
+        "gps_admin1": exif.get("state") or "",
+        "gps_country": country,
+        "gps_country_code": _country_code(country),
+    }
+    raw_dt = exif.get("dateTimeOriginal") or asset.get("localDateTime") or asset.get("fileCreatedAt")
+    dt = _parse_iso_utc(raw_dt) if raw_dt else None
+    return gps, geo, dt
+
+
+@app.post("/immich/test")
+async def immich_test(req: ImmichCreds) -> dict[str, Any]:
+    try:
+        info = await immich_client.test_connection(req.base_url, req.api_key, verify=req.verify_tls)
+    except immich_client.ImmichError as exc:
+        raise HTTPException(400, str(exc))
+    return {"ok": True, "version": _version_str(info)}
+
+
+@app.post("/immich/albums")
+async def immich_albums(req: ImmichCreds) -> dict[str, Any]:
+    try:
+        albums = await immich_client.list_albums(req.base_url, req.api_key, verify=req.verify_tls)
+    except immich_client.ImmichError as exc:
+        raise HTTPException(400, str(exc))
+    return {
+        "albums": [
+            {
+                "id": a.get("id"),
+                "name": a.get("albumName") or a.get("name") or "(untitled)",
+                "count": a.get("assetCount", 0),
+            }
+            for a in albums
+            if a.get("id")
+        ]
+    }
+
+
+@app.post("/immich/import")
+async def immich_import(req: ImmichImportRequest) -> dict[str, Any]:
+    if not req.album_ids:
+        raise HTTPException(400, "no albums selected")
+    job_id = uuid.uuid4().hex
+    _register_job(job_id, {
+        "total": 0,  # unknown until enumeration finishes; grows live
+        "done": 0,
+        "skipped": 0,
+        "failed": 0,
+        "status": "running",
+        "errors": [],
+        "items": {},
+        "phase": "enumerating",  # -> "importing" -> (job status "done"); "error" if enumeration fails
+    })
+    asyncio.create_task(_run_immich_import(job_id, req))
+    return {"job_id": job_id}
+
+
+async def _run_immich_import(job_id: str, req: ImmichImportRequest) -> None:
+    job = _jobs[job_id]
+    ns = kc.namespace()
+    # Two dedup layers, built once up front:
+    #  - existing_hashes: SHA256 content hash (khora external_id). Authoritative,
+    #    shared with _process_photo; catches identical bytes from any source.
+    #  - existing_immich: immich_asset_id in metadata.custom. Lets us skip an
+    #    already-imported asset BEFORE downloading it or running the vision model.
+    docs = await kc.kb().list_documents(namespace=ns, limit=100000)
+    existing_hashes = {d.external_id for d in docs}
+    existing_immich = {_custom(getattr(d, "metadata", None)).get("immich_asset_id") for d in docs}
+    existing_immich.discard(None)
+
+    cache_dir = kc.DATA_DIR / "immich"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    for stale in cache_dir.glob("*.part"):  # sweep partials from an interrupted run
+        stale.unlink(missing_ok=True)
+
+    sem = asyncio.Semaphore(INGEST_CONCURRENCY)
+    breaker = _Breaker()  # same guard as drag-drop ingest: stop hammering a dead model
+    client = immich_client._client(
+        req.base_url, req.api_key, verify=req.verify_tls, timeout=immich_client.DOWNLOAD_TIMEOUT
+    )
+
+    async def one(asset: dict[str, Any]) -> None:
+        asset_id = asset.get("id") or ""
+        key = asset_id or uuid.uuid4().hex
+        async with sem:
+            if breaker.tripped:  # model looks unhealthy — don't keep hammering it
+                job["skipped"] += 1
+                job["items"][key] = {"status": "skipped", "error": "aborted after repeated failures"}
+                return
+            try:
+                # (A) Skip already-imported assets — no download, no vision.
+                if asset_id and asset_id in existing_immich:
+                    job["skipped"] += 1
+                    job["items"][key] = {"status": "skipped", "reason": "already-imported"}
+                    return
+                # (B) Download the original into the managed cache.
+                dest = cache_dir / f"{_safe_asset_id(asset_id)}{_ext_for(asset)}"
+                if not dest.exists():
+                    await immich_client.download_original(client, asset_id, dest)
+                # (C) Prefer Immich's server-side EXIF; fall back to local probes.
+                gps, geo, dt = _immich_meta(asset)
+                # (D) Shared per-photo processing (SHA256 dedup happens inside).
+                item = await _process_photo(
+                    dest,
+                    existing=existing_hashes,
+                    prefetched_gps=gps,
+                    prefetched_geo=geo,
+                    prefetched_dt=dt,
+                    extra_meta={"immich_asset_id": asset_id},
+                    title=asset.get("originalFileName") or dest.name,
+                )
+                if item["status"] == "skipped":
+                    # Byte-identical to an existing photo — drop the redundant copy.
+                    job["skipped"] += 1
+                    dest.unlink(missing_ok=True)
+                else:
+                    job["done"] += 1
+                    if asset_id:
+                        existing_immich.add(asset_id)
+                    breaker.ok()  # a real success clears the failure streak
+                job["items"][key] = item
+            except Exception as exc:  # keep the batch going; record the failure
+                msg = "timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
+                job["failed"] += 1
+                job["errors"].append({"asset": asset_id, "error": msg})
+                job["items"][key] = {"status": "failed", "error": msg}
+                if breaker.fail():
+                    job["errors"].insert(0, {"error": f"Stopped after {breaker.consec} consecutive failures — the model may be unhealthy. Restart the app and try again."})
+
+    try:
+        assets: list[dict[str, Any]] = []
+        try:
+            async for asset in immich_client.iter_assets(
+                req.base_url, req.api_key, album_ids=req.album_ids, verify=req.verify_tls
+            ):
+                assets.append(asset)
+                job["total"] = len(assets)
+        except immich_client.ImmichError as exc:
+            job["phase"] = "error"
+            job["errors"].append({"asset": None, "error": str(exc)})
+            return
+        job["phase"] = "importing"
+        await asyncio.gather(*(one(a) for a in assets))
+    finally:
+        await client.aclose()
+        job["status"] = "done"
+        if breaker.tripped:
+            job["aborted"] = True
 
 
 # ---------------------------------------------------------------------------

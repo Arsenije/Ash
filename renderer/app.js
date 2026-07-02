@@ -730,10 +730,21 @@ function applyStatus(res) {
 // ---------------------------------------------------------------------------
 // Info / About dialog
 // ---------------------------------------------------------------------------
-function openInfo() {
+async function openInfo() {
   $("#info-version").textContent = state.version ? "v" + state.version : "";
   $("#info-update-status").textContent = "";
   $("#info-rescan-status").textContent = "";
+  $("#immich-status").textContent = "";
+  try {
+    const im = await window.api.immichGet();
+    if (im) {
+      $("#immich-url").value = im.baseUrl || "";
+      $("#immich-key").value = im.apiKey || "";
+      $("#immich-verify").checked = im.verifyTls !== false;
+    }
+  } catch {
+    /* no saved connection yet */
+  }
   $("#info").classList.remove("hidden");
 }
 
@@ -780,6 +791,119 @@ async function runRescan(mode) {
       let msg = `${label} done — ${st.done} updated`;
       if (st.skipped) msg += `, ${st.skipped} skipped`;
       if (st.failed) msg += `, ${st.failed} failed`;
+      showToast(msg, { progress: 1, autohide: st.failed ? 0 : 4000 });
+      break;
+    }
+  }
+  await loadFacets();
+  await refresh();
+}
+
+// ---------------------------------------------------------------------------
+// Immich import — pull photos from a self-hosted Immich server (Info dialog).
+// Enumeration + download happen in the sidecar; progress reuses the shared
+// /ingest/status poll loop, same as drag-drop and rescan.
+// ---------------------------------------------------------------------------
+function immichCreds() {
+  return {
+    base_url: $("#immich-url").value.trim(),
+    api_key: $("#immich-key").value,
+    verify_tls: $("#immich-verify").checked,
+  };
+}
+
+async function immichPost(path, body) {
+  const res = await fetch(state.baseUrl + path, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || "HTTP " + res.status);
+  return data;
+}
+
+// Validate creds against the server, persist them, then load the album list.
+async function immichConnect() {
+  const creds = immichCreds();
+  const s = $("#immich-status");
+  if (!creds.base_url || !creds.api_key) {
+    s.textContent = "Enter your Immich server URL and an API key.";
+    return;
+  }
+  s.textContent = "Connecting…";
+  $("#immich-import").disabled = true;
+  try {
+    const info = await immichPost("/immich/test", creds);
+    await window.api.immichSave({ baseUrl: creds.base_url, apiKey: creds.api_key, verifyTls: creds.verify_tls });
+    s.textContent = `Connected${info.version ? " — Immich v" + info.version : ""}. Loading albums…`;
+    await immichLoadAlbums();
+  } catch (err) {
+    s.textContent = "Couldn't connect: " + err.message;
+  }
+}
+
+async function immichLoadAlbums() {
+  const sel = $("#immich-albums");
+  const s = $("#immich-status");
+  try {
+    const { albums } = await immichPost("/immich/albums", immichCreds());
+    sel.innerHTML = "";
+    for (const a of albums || []) {
+      const opt = document.createElement("option");
+      opt.value = a.id;
+      opt.textContent = `${a.name} (${a.count})`;
+      sel.appendChild(opt);
+    }
+    const has = (albums || []).length > 0;
+    sel.disabled = !has;
+    $("#immich-import").disabled = !has;
+    s.textContent = has ? `Select albums to import (${albums.length} available).` : "No albums found on this server.";
+  } catch (err) {
+    s.textContent = "Couldn't load albums: " + err.message;
+  }
+}
+
+async function immichImport() {
+  const albumIds = [...$("#immich-albums").selectedOptions].map((o) => o.value);
+  const s = $("#immich-status");
+  if (!albumIds.length) {
+    s.textContent = "Select at least one album first.";
+    return;
+  }
+  let job;
+  try {
+    job = await immichPost("/immich/import", { ...immichCreds(), album_ids: albumIds });
+  } catch (err) {
+    s.textContent = "Couldn't start import: " + err.message;
+    return;
+  }
+  $("#info").classList.add("hidden");
+  showToast("Immich — finding photos…", { progress: 0 });
+  while (true) {
+    await sleep(800);
+    let st;
+    try {
+      st = await getJSON("/ingest/status?job_id=" + job.job_id);
+    } catch {
+      break;
+    }
+    if (st.phase === "error") {
+      const msg = (st.errors && st.errors[0] && st.errors[0].error) || "import failed";
+      showToast("Immich import failed — " + msg, { progress: 1, autohide: 0 });
+      break;
+    }
+    if (st.phase === "enumerating") {
+      showToast(`Immich — finding photos… (${st.total} so far)`, { progress: 0 });
+    } else {
+      const handled = st.done + (st.skipped || 0) + st.failed;
+      showToast(`Importing from Immich — ${handled}/${st.total}`, { progress: st.total ? handled / st.total : 1 });
+    }
+    if (st.status === "done" && st.phase !== "enumerating") {
+      let msg = `Immich import done — ${st.done} added`;
+      if (st.skipped) msg += `, ${st.skipped} skipped`;
+      if (st.failed) msg += `, ${st.failed} failed`;
+      if (st.failed && st.errors && st.errors[0]) msg += ` · ${st.errors[0].error}`;
       showToast(msg, { progress: 1, autohide: st.failed ? 0 : 4000 });
       break;
     }
@@ -877,6 +1001,8 @@ function wire() {
   $("#info-update").onclick = checkUpdates;
   $("#info-redescribe").onclick = () => runRescan("describe");
   $("#info-reextract").onclick = () => runRescan("extract");
+  $("#immich-test").onclick = immichConnect;
+  $("#immich-import").onclick = immichImport;
   document.querySelectorAll("[data-close]").forEach((b) => {
     b.onclick = () => b.closest(".modal").classList.add("hidden");
   });

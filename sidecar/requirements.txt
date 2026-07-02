@@ -3,7 +3,9 @@
 fastapi
 uvicorn[standard]
 openai
+httpx
 pillow
+pillow-heif
 python-multipart
 reverse_geocoder
 pycountry

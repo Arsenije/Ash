@@ -16,6 +16,10 @@ contextBridge.exposeInMainWorld("api", {
   },
   pickPaths: () => ipcRenderer.invoke("pick-paths"),
   reveal: (p) => ipcRenderer.invoke("reveal", p),
+  // Immich connection settings (persisted in main; API key encrypted at rest).
+  immichGet: () => ipcRenderer.invoke("immich-get"),
+  immichSave: (cfg) => ipcRenderer.invoke("immich-save", cfg),
+  immichClear: () => ipcRenderer.invoke("immich-clear"),
   // Resolve absolute filesystem paths for dragged-in File objects.
   // file.path was removed in Electron 32+; webUtils.getPathForFile is the replacement.
   pathForFile: (file) => webUtils.getPathForFile(file),
