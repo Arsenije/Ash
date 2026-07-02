@@ -25,7 +25,6 @@ let sidecarToken = ""; // per-session shared secret guarding the sidecar HTTP AP
 let llamaSwap = null;
 let swapPort = 0;
 let dataDir = "";
-let modelsDir = "";
 let swapConfigPath = "";
 let settingsPath = "";
 
@@ -223,104 +222,82 @@ function runtimeAvailable() {
 }
 
 // ---------------------------------------------------------------------------
-// Model files — local paths + HuggingFace download with progress.
+// Model files — fetched into and reused from the shared HuggingFace hub cache.
+// download_models.py (sidecar venv) does the fetch/reuse; the resolved absolute
+// cache paths are persisted in settings under "model_paths" so writeSwapConfig
+// and modelsPresent don't have to re-resolve them (or hit the network) later.
 // ---------------------------------------------------------------------------
-function modelPath(key, role) {
-  return path.join(modelsDir, role === "mmproj" ? `${key}-mmproj.gguf` : `${key}.gguf`);
+function modelPaths() {
+  return readSettings().model_paths || {}; // { key: { repo, main, mmproj|null } }
 }
 
-// Records which repo each on-disk model file came from, so changing a model in
-// MODELS (e.g. SmolVLM2 -> Qwen2.5-VL) re-downloads it instead of silently
-// serving the stale file that happens to share the same filename.
-function modelManifest() {
-  try {
-    return JSON.parse(fs.readFileSync(path.join(modelsDir, "models.json"), "utf8"));
-  } catch {
-    return {};
-  }
-}
-
-function writeManifest(man) {
-  fs.writeFileSync(path.join(modelsDir, "models.json"), JSON.stringify(man));
-}
-
+// A choice is ready when every active model's cached file still exists and came
+// from the repo the catalog currently pins — so changing a model in the catalog
+// (e.g. SmolVLM2 -> Qwen2.5-VL) reports "missing" and re-downloads.
 function modelsPresent(id = selectedChoiceId()) {
-  const man = modelManifest();
-  return Object.entries(activeModels(id)).every(
-    ([key, m]) =>
-      man[key] === m.repo && fs.existsSync(modelPath(key, "main")) && (!m.mmproj || fs.existsSync(modelPath(key, "mmproj")))
-  );
+  const saved = modelPaths();
+  return Object.entries(activeModels(id)).every(([key, m]) => {
+    const p = saved[key];
+    return (
+      p &&
+      p.repo === m.repo &&
+      p.main &&
+      fs.existsSync(p.main) &&
+      (!m.mmproj || (p.mmproj && fs.existsSync(p.mmproj)))
+    );
+  });
 }
 
-// List a repo's files via the HF API, then pick the GGUF (or its mmproj).
-async function resolveHfFile(repo, quant, { mmproj = false } = {}) {
-  const res = await fetch(`https://huggingface.co/api/models/${repo}`);
-  if (!res.ok) throw new Error(`HuggingFace lookup failed for ${repo} (${res.status})`);
-  const data = await res.json();
-  const ggufs = (data.siblings || []).map((s) => s.rfilename).filter((f) => f.toLowerCase().endsWith(".gguf"));
-  if (mmproj) return ggufs.find((f) => f.toLowerCase().includes("mmproj")) || null;
-  const q = quant.toLowerCase();
-  return (
-    ggufs.find((f) => f.toLowerCase().includes(q) && !f.toLowerCase().includes("mmproj")) ||
-    ggufs.find((f) => !f.toLowerCase().includes("mmproj")) ||
-    null
-  );
-}
-
-function hfUrl(repo, file) {
-  return `https://huggingface.co/${repo}/resolve/main/${file}`;
-}
-
-// Stream a download to disk (with backpressure), reporting fraction complete.
-// Writes to a .part file and only promotes it to `dest` once the full
-// content-length has arrived, so a dropped/truncated connection can't leave a
-// corrupt model that later looks valid. Cleans up the .part on any failure.
-async function downloadTo(url, dest, onProgress) {
-  const res = await fetch(url);
-  if (!res.ok || !res.body) throw new Error(`download failed (${res.status})`);
-  const total = Number(res.headers.get("content-length")) || 0;
-  const tmp = `${dest}.part`;
-  const out = fs.createWriteStream(tmp);
-  let received = 0;
-  try {
-    for await (const chunk of res.body) {
-      received += chunk.length;
-      if (!out.write(Buffer.from(chunk))) await new Promise((r) => out.once("drain", r));
-      if (total) onProgress(received / total);
-    }
-    await new Promise((resolve, reject) => out.end((err) => (err ? reject(err) : resolve())));
-  } catch (err) {
-    out.destroy();
-    fs.rmSync(tmp, { force: true });
-    throw err;
-  }
-  if (total && received !== total) {
-    fs.rmSync(tmp, { force: true });
-    throw new Error(`download incomplete: got ${received} of ${total} bytes`);
-  }
-  fs.renameSync(tmp, dest);
-}
-
-// Download every model (skipping ones already on disk), reporting progress.
-async function downloadModels(id, onProgress) {
-  fs.mkdirSync(modelsDir, { recursive: true });
-  const man = modelManifest();
-  for (const [key, m] of Object.entries(activeModels(id))) {
-    const stale = man[key] !== m.repo; // model identity changed -> re-fetch over the old file
-    const jobs = [{ role: "main", label: m.label }];
-    if (m.mmproj) jobs.push({ role: "mmproj", label: `${m.label} (vision projector)` });
-    for (const job of jobs) {
-      const dest = modelPath(key, job.role);
-      if (!stale && fs.existsSync(dest) && fs.statSync(dest).size > 0) continue; // already have it
-      const file = await resolveHfFile(m.repo, m.quant, { mmproj: job.role === "mmproj" });
-      if (!file) throw new Error(`no ${job.role} GGUF found in ${m.repo}`);
-      onProgress({ model: job.label, fraction: 0 });
-      await downloadTo(hfUrl(m.repo, file), dest, (f) => onProgress({ model: job.label, fraction: f }));
-      onProgress({ model: job.label, fraction: 1 });
-    }
-    man[key] = m.repo;
-    writeManifest(man);
-  }
+// Fetch (or reuse from the shared HF cache) every model for a choice by running
+// download_models.py in the sidecar venv. Streams coarse per-file progress via
+// onProgress and resolves to { paths: { key: { repo, main, mmproj|null } },
+// cacheDir }. cacheDir is persisted so reapOrphans can match model servers by
+// their -m cache path.
+function runDownloader(id, onProgress) {
+  return new Promise((resolve, reject) => {
+    const spec = {
+      roles: Object.entries(activeModels(id)).map(([key, m]) => ({
+        key,
+        label: m.label,
+        repo: m.repo,
+        quant: m.quant,
+        mmproj: Boolean(m.mmproj),
+      })),
+    };
+    const child = spawn(PY, [path.join(SIDECAR_DIR, "download_models.py"), "download", JSON.stringify(spec)], {
+      cwd: SIDECAR_DIR,
+      env: process.env, // inherits HF_HOME/HF_HUB_CACHE/HF_TOKEN if the user set them
+    });
+    let buf = "";
+    let result = null;
+    let cacheDir = "";
+    let lastErr = "";
+    child.stdout.on("data", (d) => {
+      buf += d;
+      for (let nl; (nl = buf.indexOf("\n")) >= 0; ) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (msg.result) result = msg.result;
+          else if (msg.cache) cacheDir = msg.cache;
+          else if (msg.model) onProgress(msg);
+        } catch {
+          /* ignore non-JSON noise */
+        }
+      }
+    });
+    child.stderr.on("data", (d) => {
+      lastErr = String(d);
+      process.stderr.write(`[download] ${d}`);
+    });
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0 && result) resolve({ paths: result, cacheDir });
+      else reject(new Error(lastErr.trim().split("\n").pop() || `model download exited ${code}`));
+    });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -332,19 +309,21 @@ function writeSwapConfig() {
   // cmd is a YAML block scalar (|) so the quoted paths aren't parsed as YAML.
   // ${PORT} is llama-swap's macro (assigned per backend) — keep it literal.
   const models = activeModels();
+  const saved = modelPaths();
+  const mp = (key, role) => q(role === "mmproj" ? saved[key].mmproj : saved[key].main);
   // The vision model also serves khora's text extraction, so it needs --jinja
   // (its chat template) and handles both image and text-only requests on one
   // backend. A separate "text" block is emitted only for the lightweight choice.
   let cfg = "models:\n";
-  cfg += `  vision:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("vision", "main"))} --mmproj ${q(modelPath("vision", "mmproj"))}\n`;
+  cfg += `  vision:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${mp("vision", "main")} --mmproj ${mp("vision", "mmproj")}\n`;
   if (models.text) {
-    cfg += `  text:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${q(modelPath("text", "main"))}\n`;
+    cfg += `  text:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} --jinja -m ${mp("text", "main")}\n`;
   }
   // Embed runs CPU-only (-ngl 0): tiny (~80MB), negligible latency, and off Metal
   // so it can't contend with the GPU-heavy vision model. Batch/context are raised
   // to nomic's full 2048 (llama-server otherwise auto-caps n_batch at 512 and
   // returns HTTP 500 on any input >512 tokens — "input too large to process").
-  cfg += `  embed:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} -ngl 0 -c 2048 -b 2048 -ub 2048 -m ${q(modelPath("embed", "main"))} --embedding\n`;
+  cfg += `  embed:\n    ttl: 300\n    cmd: |\n      ${q(server)} --host 127.0.0.1 --port \${PORT} -ngl 0 -c 2048 -b 2048 -ub 2048 -m ${mp("embed", "main")} --embedding\n`;
   // Keep every active model co-resident (swap: false) instead of letting
   // llama-swap evict one to load another. Ingest hits describe (vision) then
   // embed back-to-back; swapping between them would kill an in-flight request
@@ -372,14 +351,15 @@ function killTree(proc, signal = "SIGTERM") {
 
 // Reap llama-swap / llama-server processes left over from a previous session that
 // didn't shut down cleanly (a crash or force-quit skips before-quit, so killTree
-// never ran). Matched by our own config + models paths, so unrelated llama
+// never ran). Matched by our own swap-config path (llama-swap's --config arg) and
+// the HF cache dir (our -m model paths live under it), so unrelated llama
 // processes are never touched. Run once at startup before spawning fresh ones —
 // accumulated orphans each hold GPU/unified memory and would starve the new
 // session's models (the embed-server starvation we saw).
 function reapOrphans() {
   if (process.platform === "win32") return; // pgrep is POSIX-only; Windows reap TODO
   const pids = new Set();
-  for (const needle of [swapConfigPath, modelsDir].filter(Boolean)) {
+  for (const needle of [swapConfigPath, readSettings().hf_cache_dir].filter(Boolean)) {
     try {
       for (const line of execFileSync("pgrep", ["-f", needle], { encoding: "utf8" }).split("\n")) {
         const pid = Number.parseInt(line, 10);
@@ -551,12 +531,17 @@ ipcMain.handle("engine-set", async (_e, choiceId) => {
   return { ok: true, ...(await engineStatus()) };
 });
 
-// Download the model GGUFs from HuggingFace, forwarding progress to the renderer.
+// Fetch/reuse the model GGUFs via the shared HF cache, forwarding progress to
+// the renderer, then persist the resolved cache paths for writeSwapConfig.
 ipcMain.handle("download-models", async (e, choiceId) => {
   const id = choiceById(choiceId).id;
   const send = (p) => e.sender.send("model-download-progress", p);
   try {
-    await downloadModels(id, send);
+    const { paths, cacheDir } = await runDownloader(id, send);
+    const s = readSettings();
+    s.model_paths = { ...(s.model_paths || {}), ...paths };
+    if (cacheDir) s.hf_cache_dir = cacheDir;
+    writeSettings(s);
     return { ok: true };
   } catch (err) {
     return { ok: false, error: String(err.message || err) };
@@ -615,10 +600,27 @@ function createWindow() {
 app.whenReady().then(async () => {
   const userData = app.getPath("userData");
   dataDir = path.join(userData, "khora-data");
-  modelsDir = path.join(userData, "models");
   swapConfigPath = path.join(userData, "llama-swap.yaml");
   settingsPath = path.join(userData, "settings.json");
   fs.mkdirSync(dataDir, { recursive: true });
+
+  // One-time migration: older versions kept private GGUF copies in
+  // <userData>/models; models now live in the shared HF cache, so reclaim that
+  // (2–6 GB of) dead weight. The flat files can't be relinked into the hashed
+  // cache layout, so they're just removed — a first download re-populates the
+  // shared cache (instantly if another app already has the model).
+  const legacyModels = path.join(userData, "models");
+  const migrated = readSettings();
+  if (fs.existsSync(legacyModels) && !migrated.migrated_hf_cache) {
+    try {
+      fs.rmSync(legacyModels, { recursive: true, force: true });
+    } catch (err) {
+      console.error("legacy models cleanup failed:", err);
+    }
+    migrated.migrated_hf_cache = true;
+    writeSettings(migrated);
+  }
+
   reapOrphans(); // clear runtime processes orphaned by a previous crash/force-quit before starting fresh
 
   app.setAboutPanelOptions({ applicationName: "Ash", applicationVersion: app.getVersion() });

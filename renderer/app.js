@@ -22,6 +22,7 @@ const state = {
   version: "",
   models: [], // selectable model catalog from main: [{id,label,size,blurb}]
   selectedModel: "", // chosen model id
+  downloading: false, // a model download is in progress (locks card selection)
   groupBy: "none", // none (flat gallery) | theme | location | scene | date
   chips: [], // {field, value}
   pendingField: null,
@@ -655,7 +656,7 @@ function closeEngine() {
 function gotoStep(n) {
   document.querySelectorAll(".onb-step").forEach((s) => s.classList.toggle("hidden", Number(s.dataset.step) !== n));
   if (n === 2) {
-    $("#onb-dl-status").textContent = "";
+    state.downloading = false;
     renderEngineStep();
   }
 }
@@ -688,8 +689,9 @@ function renderModelChoices() {
   if (!state.selectedModel && choices.length) state.selectedModel = choices[0].id;
   box.innerHTML = "";
   for (const c of choices) {
+    const active = c.id === state.selectedModel;
     const card = el("div", "onb-choice");
-    card.classList.toggle("active", c.id === state.selectedModel);
+    card.classList.toggle("active", active);
     const top = el("div", "onb-choice-top");
     const name = el("b");
     name.textContent = c.label;
@@ -699,11 +701,22 @@ function renderModelChoices() {
     const blurb = el("div", "onb-choice-blurb");
     blurb.textContent = c.blurb || "";
     card.append(top, blurb);
-    card.onclick = () => {
-      state.selectedModel = c.id;
-      renderModelChoices();
-      updateDownloadLabel();
-    };
+    // Inline download progress lives on the active card, hidden until a download starts.
+    if (active) {
+      const prog = el("div", "onb-choice-progress hidden");
+      const pstatus = el("div", "onb-choice-status");
+      const bar = el("div", "onb-choice-bar");
+      bar.append(el("i"));
+      prog.append(pstatus, bar);
+      card.append(prog);
+    }
+    if (!state.downloading) {
+      card.onclick = () => {
+        state.selectedModel = c.id;
+        renderModelChoices();
+        updateDownloadLabel();
+      };
+    }
     box.appendChild(card);
   }
   updateDownloadLabel();
@@ -925,31 +938,47 @@ async function finishEngine(res, statusEl) {
 }
 
 // Recommended path: download the local models, then start on them.
+// Progress renders inline on the selected model card, not in the toast.
 async function downloadLocal() {
   const dl = $("#onb-download");
-  const status = $("#onb-dl-status");
   dl.disabled = true;
-  status.textContent = "Starting download…";
+  state.downloading = true;
+  renderModelChoices(); // rebuild so the active card carries the (now uneditable) progress region
+  const card = $("#onb-model-choices .onb-choice.active");
+  const prog = card && card.querySelector(".onb-choice-progress");
+  const status = card && card.querySelector(".onb-choice-status");
+  const fill = card && card.querySelector(".onb-choice-bar > i");
+  if (prog) prog.classList.remove("hidden");
+  if (status) status.textContent = "Starting download…";
   const off = window.api.onModelProgress((p) => {
     const pct = Math.round((p.fraction || 0) * 100);
-    status.textContent = `Downloading ${p.model} — ${pct}%`;
-    showToast(`Downloading ${p.model} — ${pct}%`, { progress: p.fraction || 0 });
+    if (status) status.textContent = `Downloading ${p.model} — ${pct}%`;
+    if (fill) fill.style.width = pct + "%";
   });
   let res;
   try {
     res = await window.api.downloadModels(state.selectedModel);
   } finally {
     off();
+    state.downloading = false;
   }
-  hideToast();
   dl.disabled = false;
   if (!res.ok) {
-    status.textContent = /installed|running|available/.test(res.error || "")
-      ? "The local engine isn't available. Reinstall Ash, or check the logs."
-      : "Download stopped. " + res.error;
+    // Rebuild first (re-enables card selection), then surface the error inline on the active card.
+    renderModelChoices();
+    const failCard = $("#onb-model-choices .onb-choice.active");
+    const failProg = failCard && failCard.querySelector(".onb-choice-progress");
+    const failStatus = failCard && failCard.querySelector(".onb-choice-status");
+    const failBar = failCard && failCard.querySelector(".onb-choice-bar");
+    if (failProg) failProg.classList.remove("hidden");
+    if (failBar) failBar.classList.add("hidden"); // an error, not progress — drop the empty bar
+    if (failStatus)
+      failStatus.textContent = /installed|running|available/.test(res.error || "")
+        ? "The local engine isn't available. Reinstall Ash, or check the logs."
+        : "Download stopped. " + res.error;
     return;
   }
-  status.textContent = "Setting up…";
+  if (status) status.textContent = "Setting up…";
   await finishEngine(await window.api.engineSet(state.selectedModel), status);
 }
 
