@@ -806,7 +806,12 @@ async def facets() -> dict[str, list[str]]:
     }
 
 
-_TYPE_LABELS = {"ANIMAL": "Animals", "PLACE": "Places", "OBJECT": "Objects", "SCENE": "Scenes"}
+_TYPE_LABELS = {"PERSON": "People", "ANIMAL": "Animals", "PLACE": "Places", "OBJECT": "Objects", "SCENE": "Scenes"}
+
+
+def _type_label(t: str) -> str:
+    """Themes-group label for a (possibly user-configured or model-coined) type."""
+    return _TYPE_LABELS.get(t) or t.replace("_", " ").title()
 
 
 @app.get("/themes")
@@ -834,7 +839,7 @@ async def themes(limit_per_theme: int = 60) -> dict[str, Any]:
         for e in ents_by_type[t]:
             ids.update(str(x) for x in e.source_document_ids)
         if len(ids) >= 2:
-            themes.append({"label": _TYPE_LABELS[t], "type": t, "kind": "category", "count": len(ids), "photos": photos_for(ids)})
+            themes.append({"label": _type_label(t), "type": t, "kind": "category", "count": len(ids), "photos": photos_for(ids)})
     # Finer recurring-entity themes (same specific subject in 2+ photos).
     entity_themes: list[dict[str, Any]] = []
     for t in ENTITY_TYPES:
@@ -852,16 +857,19 @@ async def related(doc_id: str, limit: int = 12) -> dict[str, Any]:
     from collections import Counter
 
     target = _parse_uuid(doc_id)
+    # Type-agnostic: any shared entity connects two photos, whatever its type —
+    # PERSON, the core visual types, or a model-coined open type. Retrieval is
+    # about shared entity *names*, so we list every entity rather than the
+    # configured core only (one pass over all types).
     counts: Counter[Any] = Counter()
-    for t in ENTITY_TYPES:
-        for e in await kc.kb().list_entities(
-            namespace=kc.namespace(), entity_type=t, limit=1000, include_sources=True
-        ):
-            ids = set(e.source_document_ids)
-            if target in ids:
-                for other in ids:
-                    if other != target:
-                        counts[other] += 1
+    for e in await kc.kb().list_entities(
+        namespace=kc.namespace(), limit=5000, include_sources=True
+    ):
+        ids = set(e.source_document_ids)
+        if target in ids:
+            for other in ids:
+                if other != target:
+                    counts[other] += 1
     photos: list[dict[str, Any]] = []
     for other_id, shared in counts.most_common(limit):
         doc = await kc.kb().get_document(other_id, namespace=kc.namespace())
