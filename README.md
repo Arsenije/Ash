@@ -70,10 +70,7 @@ Photos are **never copied or uploaded.** Ash stores only a description and the f
 
 ## Changelog
 
-### 0.2.0 — 2026-06-18
-
-- **Safer and smarter search** (Damir Krstanovic, [#5](https://github.com/Arsenije/Ash/pull/5)) — tightened security around your local library and improved search so results are more relevant and surface related photos you'd otherwise miss.
-- **Search by place** (Aleksandar Ristic, [#4](https://github.com/Arsenije/Ash/pull/4)) — photos with GPS data now show where they were taken, and you can search, filter, and group them by city and country — all offline.
+See [CHANGELOG.md](CHANGELOG.md) for the full release history. Latest: **0.3.0** — import photos from a self-hosted Immich server.
 
 ---
 
