@@ -29,7 +29,7 @@ if (-not (Test-Path "sidecar\.venv\Scripts\python.exe")) {
   Say "Creating the Python 3.13 sidecar environment..."
   uv venv --python 3.13 sidecar\.venv
   uv pip install --python sidecar\.venv\Scripts\python.exe `
-    "khora[embedded]" fastapi "uvicorn[standard]" openai pillow python-multipart
+    "khora[embedded]" -r sidecar/requirements.txt
 }
 
 # --- 3. electron dependencies ----------------------------------------------
