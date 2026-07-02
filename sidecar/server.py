@@ -31,8 +31,32 @@ from expertise import ENTITY_TYPES, PHOTO_EXPERTISE, RELATIONSHIP_TYPES
 from vision import describe_image
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif"}
-INGEST_CONCURRENCY = 4
+INGEST_CONCURRENCY = 2  # one heavy VL doing describe+extract; 2 keeps the queue from backing up
 THUMB_SIZE = (512, 512)
+
+# Per-phase timeouts + a circuit breaker so a stuck/unhealthy model fails fast
+# instead of every photo hanging on a retry wall. Describe is generous (slow on
+# CPU/Intel); remember (extract+embed) should be quick, so it's tighter.
+VISION_TIMEOUT_S = float(os.environ.get("PHOTO_VISION_TIMEOUT", "300") or 300)
+REMEMBER_TIMEOUT_S = float(os.environ.get("PHOTO_REMEMBER_TIMEOUT", "90") or 90)
+CIRCUIT_FAILS = int(os.environ.get("PHOTO_CIRCUIT_FAILS", "6") or 6)  # consecutive failures -> abort the job
+
+
+class _Breaker:
+    """Trips after CIRCUIT_FAILS consecutive failures; any success resets it."""
+
+    def __init__(self) -> None:
+        self.consec = 0
+        self.tripped = False
+
+    def ok(self) -> None:
+        self.consec = 0
+
+    def fail(self) -> bool:
+        self.consec += 1
+        if self.consec >= CIRCUIT_FAILS:
+            self.tripped = True
+        return self.tripped
 # Relevance floor for semantic search (raw cosine, applied before khora
 # normalizes scores into a [0,1] rank). 0 disables it. Default 0.5 is
 # calibrated for the bundled nomic-embed-text-v1.5 model: on a real ingest it
@@ -358,10 +382,15 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
     # Idempotency: external_id == file content hash; skip already-ingested files.
     existing = {d.external_id for d in await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)}
     sem = asyncio.Semaphore(INGEST_CONCURRENCY)
+    breaker = _Breaker()
 
     async def one(path: Path) -> None:
         key = str(path)
         async with sem:
+            if breaker.tripped:  # model looks unhealthy — don't keep hammering it
+                job["skipped"] += 1
+                job["items"][key] = {"status": "skipped", "error": "aborted after repeated failures"}
+                return
             try:
                 job["items"][key] = {"status": "scanning"}
                 ext_id = _hash_file(path)
@@ -372,38 +401,41 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                 dt = _photo_datetime(path)
                 gps = _photo_gps(path)
                 geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
-                desc, vusage = await describe_image(path)
+                desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
                 _record_usage(vusage["model"], vusage["input"], vusage["output"])
                 await asyncio.to_thread(_make_thumbnail, path, ext_id)
                 place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country"), geo.get("gps_country_code")]
                 place_suffix = ", ".join(p for p in place_parts if p)
                 base_content = desc["description"] or f"Photo: {path.name}"
                 content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
-                result = await kc.kb().remember(
-                    content=content,
-                    namespace=kc.namespace(),
-                    title=path.name,
-                    source_type="photo",
-                    source_url=str(path.resolve()),
-                    source_timestamp=dt,
-                    external_id=ext_id,
-                    metadata={
-                        "custom": {
-                            "location": desc["location"],
-                            "objects": desc["objects"],
-                            "animals": desc["animals"],
-                            "scene": desc["scene"],
-                            "tags": desc["tags"],
-                            "occurred_at": dt.isoformat(),
-                            "filename": path.name,
-                            "gps_lat": gps[0] if gps else None,
-                            "gps_lon": gps[1] if gps else None,
-                            **geo,
-                        }
-                    },
-                    entity_types=ENTITY_TYPES,
-                    relationship_types=RELATIONSHIP_TYPES,
-                    expertise=PHOTO_EXPERTISE,
+                result = await asyncio.wait_for(
+                    kc.kb().remember(
+                        content=content,
+                        namespace=kc.namespace(),
+                        title=path.name,
+                        source_type="photo",
+                        source_url=str(path.resolve()),
+                        source_timestamp=dt,
+                        external_id=ext_id,
+                        metadata={
+                            "custom": {
+                                "location": desc["location"],
+                                "objects": desc["objects"],
+                                "animals": desc["animals"],
+                                "scene": desc["scene"],
+                                "tags": desc["tags"],
+                                "occurred_at": dt.isoformat(),
+                                "filename": path.name,
+                                "gps_lat": gps[0] if gps else None,
+                                "gps_lon": gps[1] if gps else None,
+                                **geo,
+                            }
+                        },
+                        entity_types=ENTITY_TYPES,
+                        relationship_types=RELATIONSHIP_TYPES,
+                        expertise=PHOTO_EXPERTISE,
+                    ),
+                    REMEMBER_TIMEOUT_S,
                 )
                 for u in result.llm_usage:  # extraction + embedding tokens from khora
                     _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
@@ -416,14 +448,19 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                     "ext_id": ext_id,
                     "doc_id": str(result.document_id),
                 }
+                breaker.ok()
             except Exception as exc:  # keep the batch going; record the failure
-                msg = f"{type(exc).__name__}: {exc}"
+                msg = "timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
                 job["failed"] += 1
                 job["errors"].append({"path": str(path), "error": msg})
                 job["items"][key] = {"status": "failed", "error": msg}
+                if breaker.fail():
+                    job["errors"].insert(0, {"error": f"Stopped after {breaker.consec} consecutive failures — the model may be unhealthy. Restart the app and try again."})
 
     await asyncio.gather(*(one(f) for f in files))
-    job["status"] = "done"
+    job["status"] = "done"  # 'done' so the renderer stops polling; aborted flag/errors convey the failure
+    if breaker.tripped:
+        job["aborted"] = True
 
 
 # ---------------------------------------------------------------------------
@@ -461,9 +498,13 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
     job = _jobs[job_id]
     ns = kc.namespace()
     sem = asyncio.Semaphore(INGEST_CONCURRENCY)
+    breaker = _Breaker()
 
     async def one(it: dict[str, Any]) -> None:
         async with sem:
+            if breaker.tripped:
+                job["skipped"] += 1
+                return
             try:
                 if mode == "describe":
                     src = it["source_url"]
@@ -476,7 +517,7 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                     gps = _photo_gps(path)
                     geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
                     # Describe first; if it raises we keep the existing doc (no data loss).
-                    desc, vusage = await describe_image(path)
+                    desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
                     _record_usage(vusage["model"], vusage["input"], vusage["output"])
                     await asyncio.to_thread(_make_thumbnail, path, ext_id)
                     place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country")]
@@ -484,7 +525,7 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                     base_content = desc["description"] or f"Photo: {path.name}"
                     content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
                     await kc.kb().forget(it["doc_id"], namespace=ns)
-                    result = await kc.kb().remember(
+                    result = await asyncio.wait_for(kc.kb().remember(
                         content=content,
                         namespace=ns,
                         title=it["title"] or path.name,
@@ -509,10 +550,10 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         entity_types=ENTITY_TYPES,
                         relationship_types=RELATIONSHIP_TYPES,
                         expertise=PHOTO_EXPERTISE,
-                    )
+                    ), REMEMBER_TIMEOUT_S)
                 else:  # extract: rebuild the entity graph from the stored description
                     await kc.kb().forget(it["doc_id"], namespace=ns)
-                    result = await kc.kb().remember(
+                    result = await asyncio.wait_for(kc.kb().remember(
                         content=it["content"] or f"Photo: {it['title'] or ''}",
                         namespace=ns,
                         title=it["title"],
@@ -524,17 +565,23 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         entity_types=ENTITY_TYPES,
                         relationship_types=RELATIONSHIP_TYPES,
                         expertise=PHOTO_EXPERTISE,
-                    )
+                    ), REMEMBER_TIMEOUT_S)
                 for u in result.llm_usage:
                     _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
                 _persist_usage()
                 job["done"] += 1
+                breaker.ok()
             except Exception as exc:
+                msg = "timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
                 job["failed"] += 1
-                job["errors"].append({"doc_id": str(it["doc_id"]), "error": f"{type(exc).__name__}: {exc}"})
+                job["errors"].append({"doc_id": str(it["doc_id"]), "error": msg})
+                if breaker.fail():
+                    job["errors"].insert(0, {"error": f"Stopped after {breaker.consec} consecutive failures — the model may be unhealthy. Restart the app and try again."})
 
     await asyncio.gather(*(one(it) for it in items))
     job["status"] = "done"
+    if breaker.tripped:
+        job["aborted"] = True
 
 
 # ---------------------------------------------------------------------------

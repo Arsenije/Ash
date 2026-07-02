@@ -119,21 +119,9 @@
             </li>
           </ul>
 
-          <div class="onb-h onb-h-gap">Downloads now · ~3.5 GB</div>
-          <ul class="onb-models">
-            <li>
-              <div class="onb-m-top"><span class="onb-m-name"><b>SmolVLM2 2.2B</b><a class="onb-ext" href="https://huggingface.co/ggml-org/SmolVLM2-2.2B-Instruct-GGUF" target="_blank" rel="noopener" aria-label="SmolVLM2 on Hugging Face">↗</a></span><span>~1.5 GB</span></div>
-              <div class="onb-m-sub">Vision model — looks at each photo and writes the description (includes the vision projector).</div>
-            </li>
-            <li>
-              <div class="onb-m-top"><span class="onb-m-name"><b>Nomic Embed</b><a class="onb-ext" href="https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF" target="_blank" rel="noopener" aria-label="Nomic Embed on Hugging Face">↗</a></span><span>~80 MB</span></div>
-              <div class="onb-m-sub">Embeddings — turns descriptions into vectors so you can search by meaning.</div>
-            </li>
-            <li>
-              <div class="onb-m-top"><span class="onb-m-name"><b>Qwen2.5 3B</b><a class="onb-ext" href="https://huggingface.co/bartowski/Qwen2.5-3B-Instruct-GGUF" target="_blank" rel="noopener" aria-label="Qwen2.5 3B on Hugging Face">↗</a></span><span>~1.9 GB</span></div>
-              <div class="onb-m-sub">Text model — pulls out places, objects, and scenes to link related photos.</div>
-            </li>
-          </ul>
+          <div class="onb-h onb-h-gap">Choose a model · downloads once, runs locally</div>
+          <div id="onb-model-choices" class="onb-choices"></div>
+          <p class="hint">Plus a small embeddings model (Nomic, ~80 MB) for semantic search.</p>
 
           <!-- shown when this machine will run these slowly (Intel / low RAM) -->
           <div id="onb-warn" class="onb-warn hidden"></div>
