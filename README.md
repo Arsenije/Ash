@@ -49,6 +49,43 @@ npm start
 
 ---
 
+## Installing as a coding agent
+
+If you're an AI coding agent (or running setup headless/in CI), the one-command
+setup mostly works — but there are a few things it does that assume a human at a
+terminal. Watch for these:
+
+- **Never launch the GUI.** `npm run setup` ends by starting the Electron app,
+  which will hang a headless session. Always set `ASH_NO_LAUNCH=1`:
+
+  ```bash
+  ASH_NO_LAUNCH=1 npm run setup        # macOS / Linux
+  $env:ASH_NO_LAUNCH=1; npm run setup:win   # Windows (PowerShell)
+  ```
+
+- **Install `uv` first on macOS / Linux.** `setup.sh` only offers to install
+  `uv` interactively; with no TTY (an agent, CI) it *declines* and aborts with
+  "Can't continue without uv." Install it before running setup:
+
+  ```bash
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  export PATH="$HOME/.local/bin:$PATH"
+  ```
+
+  (The Windows script installs `uv` automatically, so this step is macOS/Linux only.)
+
+- **Network access is required.** Setup downloads the `llama.cpp` + `llama-swap`
+  binaries from GitHub, and the app downloads ~3.5 GB of models from HuggingFace
+  on first run. A sandbox with no outbound network will fail at these steps.
+
+- **Prerequisites:** Node 18+ must already be present; `uv` fetches Python 3.13
+  itself. Every step is idempotent, so re-running after a failure is safe.
+
+- **Adding Python dependencies?** Put them in `sidecar/requirements.txt` — setup
+  installs the sidecar from that file, so anything added elsewhere won't be picked up.
+
+---
+
 ## Privacy
 
 This is the whole point of Ash: everything happens on your own computer. Describing photos, generating search, finding connections — all of it runs locally using AI models on your machine. No account, no API keys, no network calls.
