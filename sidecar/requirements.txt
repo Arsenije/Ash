@@ -4,6 +4,10 @@ fastapi
 uvicorn[standard]
 openai
 httpx
+# GGUF fetch/reuse via the shared HuggingFace hub cache (electron/main.js spawns
+# download_models.py). Present transitively through khora[embedded], but pinned
+# here because it's load-bearing for model download.
+huggingface_hub
 pillow
 pillow-heif
 python-multipart
