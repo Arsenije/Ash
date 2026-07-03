@@ -246,6 +246,14 @@ h2, h3 { font-weight: 600; }
 .onb-link:hover { opacity: 1; }
 .onb-warn { border: 1px solid var(--fg); padding: 12px 14px; margin-bottom: 18px; font-size: 14px; }
 .onb-actions { margin-top: 28px; display: flex; align-items: center; gap: 14px; }
-.onb-status { font-size: 14px; opacity: .75; min-height: 18px; margin-top: 12px; }
+
+/* inline download progress on the active model card */
+.onb-choice-progress { margin-top: 12px; }
+.onb-choice-status { font-size: 13px; margin-bottom: 6px; }
+.onb-choice-bar { height: 8px; border: 1px solid var(--fg); }
+.onb-choice-bar > i { display: block; height: 100%; width: 0; background: var(--fg); transition: width .2s linear; }
+/* the active card is inverted (fg background) — flip the bar to stay visible */
+.onb-choice.active .onb-choice-bar { border-color: var(--bg); }
+.onb-choice.active .onb-choice-bar > i { background: var(--bg); }
 
 @media (max-width: 560px) { .onb-cols { grid-template-columns: 1fr; gap: 20px; } }

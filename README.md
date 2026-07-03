@@ -45,6 +45,10 @@ After that, drag in some photos and start searching. Next time, just run:
 npm start
 ```
 
+> 🍎 **On macOS**, setup also adds **Ash** to `~/Applications`, so you can launch
+> it from Spotlight or Raycast (search "Ash") or by double-clicking — no terminal
+> needed. Move this folder? Re-run `npm run install-app` to repoint the launcher.
+
 > 💡 **A graphics card helps a lot but isn't required.** See [Hardware](#hardware) below for what to expect on your machine.
 
 ---
