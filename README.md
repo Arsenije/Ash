@@ -85,8 +85,10 @@ terminal. Watch for these:
 - **Prerequisites:** Node 18+ must already be present; `uv` fetches Python 3.13
   itself. Every step is idempotent, so re-running after a failure is safe.
 
-- **Adding Python dependencies?** Put them in `sidecar/requirements.txt` — setup
-  installs the sidecar from that file, so anything added elsewhere won't be picked up.
+- **Adding Python dependencies?** Put them in `sidecar/requirements.txt`, then
+  regenerate the lock setup actually installs from:
+  `uv pip compile sidecar/requirements.txt --universal --python-version 3.13 -o sidecar/requirements.lock`.
+  Anything added elsewhere won't be picked up.
 
 ---
 
@@ -136,7 +138,7 @@ Three local models do the work, all downloaded once (~3.5 GB): **SmolVLM2 2.2B**
 ```bash
 npm run binaries                                        # llama.cpp + llama-swap for this OS/arch
 cd sidecar && uv venv --python 3.13 .venv \             # python sidecar
-  && uv pip install --python .venv/bin/python "khora[embedded]" -r requirements.txt && cd ..
+  && uv pip install --python .venv/bin/python -r requirements.lock && cd ..
 npm install                                             # electron deps
 npm start                                               # run
 ```

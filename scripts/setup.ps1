@@ -28,8 +28,10 @@ node scripts/fetch-binaries.mjs
 if (-not (Test-Path "sidecar\.venv\Scripts\python.exe")) {
   Say "Creating the Python 3.13 sidecar environment..."
   uv venv --python 3.13 sidecar\.venv
+  # The .lock pins every package (incl. khora and its full tree) to versions
+  # compiled from requirements.txt — reproducible installs, auditable upgrades.
   uv pip install --python sidecar\.venv\Scripts\python.exe `
-    "khora[embedded]" -r sidecar/requirements.txt
+    -r sidecar/requirements.lock
 }
 
 # --- 3. electron dependencies ----------------------------------------------

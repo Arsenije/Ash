@@ -1,5 +1,8 @@
-# Sidecar Python deps, installed by scripts/setup.sh and setup.ps1.
-# khora is installed separately with the embedded extra: uv pip install "khora[embedded]"
+# Sidecar Python deps — the human-edited SOURCE list. Setup installs the
+# compiled requirements.lock, not this file. After editing, regenerate it:
+#   uv pip compile sidecar/requirements.txt --universal --python-version 3.13 \
+#     -o sidecar/requirements.lock
+khora[embedded]
 fastapi
 uvicorn[standard]
 openai
