@@ -9,6 +9,7 @@ SDK directly with an image message (same pattern as the repo's
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import json
@@ -127,7 +128,9 @@ def _encode_image(path: Path) -> str:
 async def describe_image(path: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return (attributes, usage) where usage = {model, input, output} token counts."""
     mime = "image/jpeg"
-    b64 = _encode_image(path)
+    # Decoding + resizing a multi-megapixel photo is CPU-heavy; off the loop so
+    # the sidecar keeps answering status polls while photos are being prepared.
+    b64 = await asyncio.to_thread(_encode_image, path)
     resp = await _get_client().chat.completions.create(
         model=VISION_MODEL,
         response_format=_RESPONSE_FORMAT,

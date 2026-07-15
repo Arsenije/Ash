@@ -381,7 +381,8 @@ def _expand_paths(paths: list[str]) -> list[Path]:
 
 @app.post("/ingest")
 async def ingest(req: IngestRequest) -> dict[str, Any]:
-    files = _expand_paths(req.paths)
+    # rglob over a large photo tree is filesystem-bound — keep it off the loop.
+    files = await asyncio.to_thread(_expand_paths, req.paths)
     job_id = uuid.uuid4().hex
     _register_job(job_id, {
         "total": len(files),
@@ -431,16 +432,20 @@ async def _process_photo(
     server-side EXIF) to skip the local probes. ``extra_meta`` is merged into
     ``metadata.custom`` (e.g. ``immich_asset_id``). ``title`` overrides the
     document title / stored filename (defaults to ``path.name``).
+
+    File hashing, EXIF probes, and geocoding are CPU/IO-bound — they run in
+    worker threads so status polls and searches stay responsive during ingest.
     """
-    ext_id = _hash_file(path)
+    ext_id = await asyncio.to_thread(_hash_file, path)
     if ext_id in existing:
         return {"status": "skipped", "ext_id": ext_id}
-    dt = prefetched_dt or _photo_datetime(path)
-    gps = _photo_gps(path) if prefetched_gps is _UNSET else prefetched_gps
+    dt = prefetched_dt or await asyncio.to_thread(_photo_datetime, path)
+    gps = await asyncio.to_thread(_photo_gps, path) if prefetched_gps is _UNSET else prefetched_gps
     if prefetched_geo is not None:
         geo = prefetched_geo
     else:
-        geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
+        # First call loads the whole GeoNames dataset — decidedly not loop-safe.
+        geo = await asyncio.to_thread(_reverse_geocode, gps[0], gps[1]) if gps else {}
     desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
     _record_usage(vusage["model"], vusage["input"], vusage["output"])
     await asyncio.to_thread(_make_thumbnail, path, ext_id)
@@ -809,10 +814,10 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                     if path is None or not path.exists():
                         job["skipped"] += 1  # original file gone — leave the doc as-is
                         return
-                    ext_id = it["external_id"] or _hash_file(path)
-                    dt = it["source_timestamp"] or _photo_datetime(path)
-                    gps = _photo_gps(path)
-                    geo = _reverse_geocode(gps[0], gps[1]) if gps else {}
+                    ext_id = it["external_id"] or await asyncio.to_thread(_hash_file, path)
+                    dt = it["source_timestamp"] or await asyncio.to_thread(_photo_datetime, path)
+                    gps = await asyncio.to_thread(_photo_gps, path)
+                    geo = await asyncio.to_thread(_reverse_geocode, gps[0], gps[1]) if gps else {}
                     # Describe first; if it raises we keep the existing doc (no data loss).
                     desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
                     _record_usage(vusage["model"], vusage["input"], vusage["output"])
@@ -1054,14 +1059,22 @@ async def search(
         span = (hi - lo) or 1.0
         mode = "semantic+graph" if graph_order else "semantic"
 
+        # Graph-only hits aren't in the recall set — fetch them concurrently
+        # up front instead of one awaited round-trip per photo in the loop.
+        async def _fetch(key: str) -> tuple[str, Any]:
+            try:
+                return key, await kc.kb().get_document(uuid.UUID(key), namespace=ns)
+            except Exception:
+                return key, None
+
+        missing = [key for key, _ in fused if key not in docs]
+        fetched: dict[str, Any] = dict(await asyncio.gather(*(_fetch(k) for k in missing))) if missing else {}
+
         photos = []
         for key, raw in fused:
             doc = docs.get(key)
-            if doc is None:  # graph-only hit: not returned by recall, fetch it
-                try:
-                    doc = await kc.kb().get_document(uuid.UUID(key), namespace=ns)
-                except Exception:
-                    doc = None
+            if doc is None:  # graph-only hit
+                doc = fetched.get(key)
                 if doc is None:
                     continue
                 # graph-injected photos must still honour any active chip filters
@@ -1182,9 +1195,12 @@ async def related(doc_id: str, limit: int = 12) -> dict[str, Any]:
             for other in ids:
                 if other != target:
                     counts[other] += 1
+    top = counts.most_common(limit)
+    docs = await asyncio.gather(  # one concurrent batch, not a round-trip per photo
+        *(kc.kb().get_document(other_id, namespace=kc.namespace()) for other_id, _ in top)
+    )
     photos: list[dict[str, Any]] = []
-    for other_id, shared in counts.most_common(limit):
-        doc = await kc.kb().get_document(other_id, namespace=kc.namespace())
+    for (_other_id, shared), doc in zip(top, docs):
         if doc is not None:
             dto = _photo_dto(doc)
             dto["shared_entities"] = shared

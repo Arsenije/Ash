@@ -109,6 +109,25 @@ class FakeResult:
         self.llm_usage: list = []
 
 
+class FakeEntity:
+    def __init__(self, name, source_document_ids, entity_type="OBJECT"):
+        self.name = name
+        self.entity_type = entity_type
+        self.source_document_ids = list(source_document_ids)
+
+
+class FakeChunk:
+    def __init__(self, document_id, content):
+        self.document_id = document_id
+        self.content = content
+
+
+class FakeRecall:
+    def __init__(self, documents, chunks):
+        self.documents = documents
+        self.chunks = chunks
+
+
 class FakeKB:
     """Mirrors the khora semantics the sidecar relies on.
 
@@ -121,6 +140,8 @@ class FakeKB:
 
     def __init__(self):
         self.docs: dict[uuid.UUID, FakeDoc] = {}
+        self.entities: list[FakeEntity] = []
+        self.recall_result: FakeRecall | None = None
         self.calls: list[tuple[str, object]] = []
         self.remember_error: Exception | None = None
         self.remember_delay: float = 0.0
@@ -130,6 +151,15 @@ class FakeKB:
         doc = FakeDoc(**kwargs)
         self.docs[doc.id] = doc
         return doc
+
+    def seed_entity(self, name, source_document_ids, entity_type="OBJECT") -> FakeEntity:
+        ent = FakeEntity(name, source_document_ids, entity_type)
+        self.entities.append(ent)
+        return ent
+
+    def set_recall(self, documents, chunks) -> None:
+        """chunks: list of (document_id, content) pairs, best match first."""
+        self.recall_result = FakeRecall(documents, [FakeChunk(d, c) for d, c in chunks])
 
     async def list_documents(self, *, namespace, limit=100):
         return list(self.docs.values())
@@ -173,6 +203,17 @@ class FakeKB:
         if self.forget_error is not None:
             raise self.forget_error
         return self.docs.pop(doc_id, None) is not None
+
+    async def recall(self, q, *, namespace, limit=200, filter=None, **_ignored):
+        self.calls.append(("recall", q))
+        return self.recall_result or FakeRecall([], [])
+
+    async def search_entities(self, q, *, namespace, limit=8, include_sources=False):
+        self.calls.append(("search_entities", q))
+        return self.entities
+
+    async def list_entities(self, *, namespace, entity_type=None, limit=2000, include_sources=False):
+        return [e for e in self.entities if entity_type is None or e.entity_type == entity_type]
 
 
 @pytest.fixture
