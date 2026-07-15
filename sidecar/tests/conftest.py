@@ -31,7 +31,11 @@ import pytest
 # --- 1. environment, before any app import --------------------------------
 _DATA_DIR = tempfile.mkdtemp(prefix="ash-test-data-")
 os.environ["KHORA_PHOTO_DATA_DIR"] = _DATA_DIR
-os.environ.pop("PHOTO_SIDECAR_TOKEN", None)  # auth off by default; tests set server.SIDECAR_TOKEN
+# Import the app in its production shape: a token present means the CORS
+# middleware is mounted (it is skipped entirely in tokenless dev runs). Tests
+# control the gate per-case by monkeypatching server.SIDECAR_TOKEN — the
+# middleware reads the module global on every request.
+os.environ["PHOTO_SIDECAR_TOKEN"] = "conftest-import-token"
 
 
 # --- 2. fake khora package -------------------------------------------------

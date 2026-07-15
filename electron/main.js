@@ -24,6 +24,7 @@ let sidecarPort = 0;
 let sidecarToken = ""; // per-session shared secret guarding the sidecar HTTP API
 let llamaSwap = null;
 let swapPort = 0;
+let runtimeApiKey = ""; // per-session key gating llama.cpp inference endpoints (fresh per launch)
 let dataDir = "";
 let swapConfigPath = "";
 let settingsPath = "";
@@ -180,7 +181,10 @@ function engineEnv(engine) {
     PHOTO_VISION_MODEL: engine.vision_model,
     OPENAI_BASE_URL: base,
     OPENAI_API_BASE: base,
-    OPENAI_API_KEY: "sk-local", // dummy; llama.cpp ignores it
+    // The per-session llama.cpp API key (see startSwap). Doubles as the
+    // OpenAI-SDK/litellm bearer token, which llama-swap forwards to the
+    // llama-server backends for validation.
+    OPENAI_API_KEY: runtimeApiKey || "sk-local",
     KHORA_LLM_MODEL: `openai/${engine.text_model}`,
     KHORA_EXTRACTION_MODEL: `openai/${engine.text_model}`,
     KHORA_EMBED_MODEL: `openai/${engine.embed_model}`,
@@ -392,9 +396,18 @@ async function startSwap() {
   if (!swap || !findBin("llama-server")) throw new Error("llama.cpp runtime not found");
   swapPort = await freePort();
   writeSwapConfig();
+  // Gate the model servers' inference endpoints behind a per-session key so
+  // arbitrary local processes / web pages can't drive GPU inference. llama-swap
+  // passes LLAMA_API_KEY down to every llama-server it spawns (env, not argv —
+  // never visible in `ps`); the sidecar presents it as its OpenAI bearer token
+  // and llama-swap forwards the Authorization header to the backends.
+  // (/health and /v1/models stay public by llama.cpp design — the readiness
+  // probe below depends on that.)
+  runtimeApiKey = crypto.randomBytes(32).toString("hex");
   llamaSwap = spawn(swap, ["--config", swapConfigPath, "--listen", `127.0.0.1:${swapPort}`], {
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32", // own process group, so killTree reaps its llama-server children
+    env: { ...process.env, LLAMA_API_KEY: runtimeApiKey },
   });
   llamaSwap.stdout.on("data", (d) => process.stdout.write(`[swap] ${d}`));
   llamaSwap.stderr.on("data", (d) => process.stderr.write(`[swap] ${d}`));
@@ -548,11 +561,59 @@ ipcMain.handle("download-models", async (e, choiceId) => {
   }
 });
 
-// Immich connection settings (persisted; the API key is encrypted at rest).
-ipcMain.handle("immich-get", async () => loadImmich());
-ipcMain.handle("immich-save", async (_e, cfg) => {
-  saveImmich(cfg);
-  return { ok: true };
+// Immich connection settings. The API key is encrypted at rest AND never
+// leaves this process: the renderer only learns whether a key is saved, and
+// Immich requests are proxied through here with the stored (or newly typed)
+// key injected — so a compromised renderer can't read the credential.
+async function sidecarPost(path, body) {
+  if (!sidecarPort) return { ok: false, error: "The engine isn't running yet." };
+  try {
+    const res = await fetch(`http://127.0.0.1:${sidecarPort}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Ash-Token": sidecarToken },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { ok: false, error: data.detail || `HTTP ${res.status}` };
+    return { ok: true, data };
+  } catch (err) {
+    return { ok: false, error: String(err.message || err) };
+  }
+}
+
+// Sidecar-shaped credentials from what the renderer sent, falling back to the
+// stored connection for anything omitted (in particular an untyped API key).
+function immichBody(cfg) {
+  const stored = loadImmich();
+  return {
+    base_url: (cfg && cfg.baseUrl) || (stored && stored.baseUrl) || "",
+    api_key: (cfg && cfg.apiKey) || (stored && stored.apiKey) || "",
+    verify_tls: cfg ? cfg.verifyTls !== false : !stored || stored.verifyTls !== false,
+  };
+}
+
+ipcMain.handle("immich-get", async () => {
+  const im = loadImmich();
+  return im ? { baseUrl: im.baseUrl, verifyTls: im.verifyTls, hasKey: Boolean(im.apiKey) } : null;
+});
+// Validate against the server; persist the connection only once it works.
+ipcMain.handle("immich-test", async (_e, cfg) => {
+  const body = immichBody(cfg);
+  const res = await sidecarPost("/immich/test", body);
+  if (!res.ok) return res;
+  saveImmich({ baseUrl: body.base_url, apiKey: body.api_key, verifyTls: body.verify_tls });
+  return { ok: true, version: res.data.version || "" };
+});
+ipcMain.handle("immich-albums", async (_e, cfg) => {
+  const res = await sidecarPost("/immich/albums", immichBody(cfg));
+  return res.ok ? { ok: true, albums: res.data.albums || [] } : res;
+});
+ipcMain.handle("immich-import", async (_e, payload) => {
+  const res = await sidecarPost("/immich/import", {
+    ...immichBody(payload),
+    album_ids: (payload && payload.albumIds) || [],
+  });
+  return res.ok ? { ok: true, job_id: res.data.job_id } : res;
 });
 ipcMain.handle("immich-clear", async () => {
   clearImmich();

@@ -752,8 +752,11 @@ async function openInfo() {
     const im = await window.api.immichGet();
     if (im) {
       $("#immich-url").value = im.baseUrl || "";
-      $("#immich-key").value = im.apiKey || "";
       $("#immich-verify").checked = im.verifyTls !== false;
+      // The saved key never reaches this renderer — main injects it server-side.
+      immichHasSavedKey = Boolean(im.hasKey);
+      $("#immich-key").value = "";
+      $("#immich-key").placeholder = immichHasSavedKey ? "API key (saved)" : "API key";
     }
   } catch {
     /* no saved connection yet */
@@ -817,64 +820,60 @@ async function runRescan(mode) {
 // Enumeration + download happen in the sidecar; progress reuses the shared
 // /ingest/status poll loop, same as drag-drop and rescan.
 // ---------------------------------------------------------------------------
+// Whether main has a saved API key for the current connection — lets the key
+// field stay blank (the renderer never sees the stored secret).
+let immichHasSavedKey = false;
+
 function immichCreds() {
   return {
-    base_url: $("#immich-url").value.trim(),
-    api_key: $("#immich-key").value,
-    verify_tls: $("#immich-verify").checked,
+    baseUrl: $("#immich-url").value.trim(),
+    apiKey: $("#immich-key").value || undefined, // blank → main injects the saved key
+    verifyTls: $("#immich-verify").checked,
   };
 }
 
-async function immichPost(path, body) {
-  const res = await fetch(state.baseUrl + path, {
-    method: "POST",
-    headers: authHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || "HTTP " + res.status);
-  return data;
-}
-
-// Validate creds against the server, persist them, then load the album list.
+// Validate creds against the server (main persists them on success), then load albums.
 async function immichConnect() {
   const creds = immichCreds();
   const s = $("#immich-status");
-  if (!creds.base_url || !creds.api_key) {
+  if (!creds.baseUrl || (!creds.apiKey && !immichHasSavedKey)) {
     s.textContent = "Enter your Immich server URL and an API key.";
     return;
   }
   s.textContent = "Connecting…";
   $("#immich-import").disabled = true;
-  try {
-    const info = await immichPost("/immich/test", creds);
-    await window.api.immichSave({ baseUrl: creds.base_url, apiKey: creds.api_key, verifyTls: creds.verify_tls });
-    s.textContent = `Connected${info.version ? " — Immich v" + info.version : ""}. Loading albums…`;
-    await immichLoadAlbums();
-  } catch (err) {
-    s.textContent = "Couldn't connect: " + err.message;
+  const res = await window.api.immichTest(creds);
+  if (!res.ok) {
+    s.textContent = "Couldn't connect: " + res.error;
+    return;
   }
+  immichHasSavedKey = true;
+  $("#immich-key").value = "";
+  $("#immich-key").placeholder = "API key (saved)";
+  s.textContent = `Connected${res.version ? " — Immich v" + res.version : ""}. Loading albums…`;
+  await immichLoadAlbums();
 }
 
 async function immichLoadAlbums() {
   const sel = $("#immich-albums");
   const s = $("#immich-status");
-  try {
-    const { albums } = await immichPost("/immich/albums", immichCreds());
-    sel.innerHTML = "";
-    for (const a of albums || []) {
-      const opt = document.createElement("option");
-      opt.value = a.id;
-      opt.textContent = `${a.name} (${a.count})`;
-      sel.appendChild(opt);
-    }
-    const has = (albums || []).length > 0;
-    sel.disabled = !has;
-    $("#immich-import").disabled = !has;
-    s.textContent = has ? `Select albums to import (${albums.length} available).` : "No albums found on this server.";
-  } catch (err) {
-    s.textContent = "Couldn't load albums: " + err.message;
+  const res = await window.api.immichAlbums(immichCreds());
+  if (!res.ok) {
+    s.textContent = "Couldn't load albums: " + res.error;
+    return;
   }
+  const albums = res.albums || [];
+  sel.innerHTML = "";
+  for (const a of albums) {
+    const opt = document.createElement("option");
+    opt.value = a.id;
+    opt.textContent = `${a.name} (${a.count})`;
+    sel.appendChild(opt);
+  }
+  const has = albums.length > 0;
+  sel.disabled = !has;
+  $("#immich-import").disabled = !has;
+  s.textContent = has ? `Select albums to import (${albums.length} available).` : "No albums found on this server.";
 }
 
 async function immichImport() {
@@ -884,13 +883,12 @@ async function immichImport() {
     s.textContent = "Select at least one album first.";
     return;
   }
-  let job;
-  try {
-    job = await immichPost("/immich/import", { ...immichCreds(), album_ids: albumIds });
-  } catch (err) {
-    s.textContent = "Couldn't start import: " + err.message;
+  const res = await window.api.immichImport({ ...immichCreds(), albumIds });
+  if (!res.ok) {
+    s.textContent = "Couldn't start import: " + res.error;
     return;
   }
+  const job = res;
   $("#info").classList.add("hidden");
   showToast("Immich — finding photos…", { progress: 0 });
   while (true) {
