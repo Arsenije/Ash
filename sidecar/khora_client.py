@@ -59,8 +59,37 @@ def _build_config() -> KhoraConfig:
     return config
 
 
+def ensure_local_models() -> None:
+    """Refuse to default to hosted OpenAI (privacy guard for standalone runs).
+
+    khora's litellm falls back to OpenAI-hosted models when the KHORA_*_MODEL
+    env vars are unset — which would silently ship photo descriptions to the
+    cloud in a dev run with an ambient ``OPENAI_API_KEY``. Acceptable setups:
+    a local/self-hosted base URL, models explicitly routed to a non-OpenAI
+    provider, or an explicit ``PHOTO_ALLOW_CLOUD=1`` opt-in.
+    """
+    if os.environ.get("PHOTO_ALLOW_CLOUD") == "1":
+        return
+    if os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE"):
+        return
+    models = [
+        os.environ.get("KHORA_LLM_MODEL"),
+        os.environ.get("KHORA_EXTRACTION_MODEL"),
+        os.environ.get("KHORA_EMBED_MODEL"),
+    ]
+    if all(m and not m.startswith("openai/") for m in models):
+        return  # every model explicitly routed to a non-OpenAI provider
+    raise RuntimeError(
+        "No local model endpoint configured — refusing to fall back to hosted "
+        "OpenAI, which would upload photo data. Set OPENAI_API_BASE/OPENAI_BASE_URL "
+        "to a local server (the Ash app does this automatically), or set "
+        "PHOTO_ALLOW_CLOUD=1 to opt in to the cloud."
+    )
+
+
 async def startup() -> None:
     global _kb, _namespace
+    ensure_local_models()
     config = _build_config()
     _kb = Khora(config, engine="vectorcypher", run_migrations=True)
     await _kb.connect()

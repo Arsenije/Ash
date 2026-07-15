@@ -10,6 +10,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import uuid
 from contextlib import asynccontextmanager
@@ -37,6 +38,13 @@ import immich_client
 import khora_client as kc
 from expertise import ENTITY_TYPES, PHOTO_EXPERTISE, RELATIONSHIP_TYPES
 from vision import describe_image
+
+# Operational log, to stderr — the Electron main process pipes and prefixes it
+# ([sidecar]), so failures leave a forensic trail beyond the job-status toasts.
+# uvicorn runs at --log-level warning; this logger is ours and stays at INFO.
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("ash.sidecar")
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".bmp", ".tiff", ".tif", ".heic", ".heif"}
 INGEST_CONCURRENCY = 2  # one heavy VL doing describe+extract; 2 keeps the queue from backing up
@@ -156,7 +164,10 @@ def _load_usage() -> None:
     try:
         loaded = json.loads(_USAGE_FILE.read_text())
         _usage = loaded if isinstance(loaded, dict) else {}  # tolerate a corrupt/non-dict file
-    except Exception:
+    except FileNotFoundError:
+        _usage = {}
+    except Exception as exc:
+        log.warning("usage file unreadable, starting fresh: %s", exc)
         _usage = {}
     _usage.setdefault("by_model", {})
     _usage.setdefault("photos", 0)
@@ -165,8 +176,8 @@ def _load_usage() -> None:
 def _persist_usage() -> None:
     try:
         _USAGE_FILE.write_text(json.dumps(_usage))
-    except Exception:
-        pass
+    except Exception as exc:
+        log.warning("could not persist usage tallies: %s", exc)
 
 
 def _record_usage(model: str, inp: int, out: int) -> None:
@@ -255,8 +266,8 @@ def _reverse_geocode(lat: float, lon: float) -> dict[str, str]:
                 "gps_country": country,
                 "gps_country_code": cc,
             }
-    except Exception:
-        pass
+    except Exception as exc:
+        log.debug("reverse geocode failed for (%s, %s): %s", lat, lon, exc)
     return {}
 
 
@@ -392,6 +403,70 @@ async def ingest_status(job_id: str) -> dict[str, Any]:
 _UNSET: Any = object()
 
 
+async def _describe_and_remember(
+    path: Path,
+    *,
+    ext_id: str,
+    title: str,
+    dt: datetime,
+    gps: tuple[float, float] | None,
+    geo: dict[str, str],
+    base_custom: dict[str, Any] | None = None,
+) -> Any:
+    """Describe one image and remember/replace its document; returns the
+    RememberResult. The single describe→thumbnail→content→remember pipeline,
+    shared by ingest (via ``_process_photo``) and rescan's describe mode —
+    previously two hand-kept copies that had already drifted apart.
+
+    khora upserts by ``external_id`` (in-place replace, same document id), so
+    calling this for an existing photo is a safe re-describe: a failure or
+    timeout anywhere leaves the current document untouched.
+
+    ``base_custom`` seeds ``metadata.custom`` — keys the pipeline doesn't
+    recompute (e.g. ``immich_asset_id``) survive; recomputed keys win.
+    Records all LLM usage (vision + khora extraction/embedding).
+    """
+    desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
+    _record_usage(vusage["model"], vusage["input"], vusage["output"])
+    await asyncio.to_thread(_make_thumbnail, path, ext_id)
+    place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country"), geo.get("gps_country_code")]
+    place_suffix = ", ".join(p for p in place_parts if p)
+    base_content = desc["description"] or f"Photo: {path.name}"
+    content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
+    custom = {
+        **(base_custom or {}),
+        "location": desc["location"],
+        "objects": desc["objects"],
+        "animals": desc["animals"],
+        "scene": desc["scene"],
+        "tags": desc["tags"],
+        "occurred_at": dt.isoformat() if hasattr(dt, "isoformat") else str(dt),
+        "filename": title,
+        "gps_lat": gps[0] if gps else None,
+        "gps_lon": gps[1] if gps else None,
+        **geo,
+    }
+    result = await asyncio.wait_for(
+        kc.kb().remember(
+            content=content,
+            namespace=kc.namespace(),
+            title=title,
+            source_type="photo",
+            source_url=str(path.resolve()),
+            source_timestamp=dt,
+            external_id=ext_id,
+            metadata={"custom": custom},
+            entity_types=ENTITY_TYPES,
+            relationship_types=RELATIONSHIP_TYPES,
+            expertise=PHOTO_EXPERTISE,
+        ),
+        REMEMBER_TIMEOUT_S,
+    )
+    for u in result.llm_usage:  # extraction + embedding tokens from khora
+        _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
+    return result
+
+
 async def _process_photo(
     path: Path,
     *,
@@ -427,46 +502,9 @@ async def _process_photo(
     else:
         # First call loads the whole GeoNames dataset — decidedly not loop-safe.
         geo = await asyncio.to_thread(_reverse_geocode, gps[0], gps[1]) if gps else {}
-    desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
-    _record_usage(vusage["model"], vusage["input"], vusage["output"])
-    await asyncio.to_thread(_make_thumbnail, path, ext_id)
-    place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country"), geo.get("gps_country_code")]
-    place_suffix = ", ".join(p for p in place_parts if p)
-    base_content = desc["description"] or f"Photo: {path.name}"
-    content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
-    name = title or path.name
-    custom = {
-        "location": desc["location"],
-        "objects": desc["objects"],
-        "animals": desc["animals"],
-        "scene": desc["scene"],
-        "tags": desc["tags"],
-        "occurred_at": dt.isoformat(),
-        "filename": name,
-        "gps_lat": gps[0] if gps else None,
-        "gps_lon": gps[1] if gps else None,
-        **geo,
-    }
-    if extra_meta:
-        custom.update(extra_meta)
-    result = await asyncio.wait_for(
-        kc.kb().remember(
-            content=content,
-            namespace=kc.namespace(),
-            title=name,
-            source_type="photo",
-            source_url=str(path.resolve()),
-            source_timestamp=dt,
-            external_id=ext_id,
-            metadata={"custom": custom},
-            entity_types=ENTITY_TYPES,
-            relationship_types=RELATIONSHIP_TYPES,
-            expertise=PHOTO_EXPERTISE,
-        ),
-        REMEMBER_TIMEOUT_S,
+    result = await _describe_and_remember(
+        path, ext_id=ext_id, title=title or path.name, dt=dt, gps=gps, geo=geo, base_custom=extra_meta
     )
-    for u in result.llm_usage:  # extraction + embedding tokens from khora
-        _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
     _usage["photos"] += 1
     _persist_usage()
     existing.add(ext_id)
@@ -475,6 +513,7 @@ async def _process_photo(
 
 async def _run_ingest(job_id: str, files: list[Path]) -> None:
     job = _jobs[job_id]
+    log.info("ingest %s: %d file(s)", job_id, len(files))
     # Idempotency: external_id == file content hash; skip already-ingested files.
     existing = {d.external_id for d in await kc.kb().list_documents(namespace=kc.namespace(), limit=100000)}
     sem = asyncio.Semaphore(INGEST_CONCURRENCY)
@@ -498,16 +537,19 @@ async def _run_ingest(job_id: str, files: list[Path]) -> None:
                 job["items"][key] = item
             except Exception as exc:  # keep the batch going; record the failure
                 msg = "timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
+                log.warning("ingest %s: %s failed: %s", job_id, path, msg)
                 job["failed"] += 1
                 job["errors"].append({"path": str(path), "error": msg})
                 job["items"][key] = {"status": "failed", "error": msg}
                 if breaker.fail():
+                    log.error("ingest %s aborted after %d consecutive failures", job_id, breaker.consec)
                     job["errors"].insert(0, {"error": f"Stopped after {breaker.consec} consecutive failures — the model may be unhealthy. Restart the app and try again."})
 
     await asyncio.gather(*(one(f) for f in files))
     job["status"] = "done"  # 'done' so the renderer stops polling; aborted flag/errors convey the failure
     if breaker.tripped:
         job["aborted"] = True
+    log.info("ingest %s done: %d added, %d skipped, %d failed", job_id, job["done"], job["skipped"], job["failed"])
 
 
 # ---------------------------------------------------------------------------
@@ -719,10 +761,12 @@ async def _run_immich_import(job_id: str, req: ImmichImportRequest) -> None:
                 job["items"][key] = item
             except Exception as exc:  # keep the batch going; record the failure
                 msg = "timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
+                log.warning("immich import %s: asset %s failed: %s", job_id, asset_id, msg)
                 job["failed"] += 1
                 job["errors"].append({"asset": asset_id, "error": msg})
                 job["items"][key] = {"status": "failed", "error": msg}
                 if breaker.fail():
+                    log.error("immich import %s aborted after %d consecutive failures", job_id, breaker.consec)
                     job["errors"].insert(0, {"error": f"Stopped after {breaker.consec} consecutive failures — the model may be unhealthy. Restart the app and try again."})
 
     try:
@@ -734,16 +778,19 @@ async def _run_immich_import(job_id: str, req: ImmichImportRequest) -> None:
                 assets.append(asset)
                 job["total"] = len(assets)
         except immich_client.ImmichError as exc:
+            log.error("immich import %s: enumeration failed: %s", job_id, exc)
             job["phase"] = "error"
             job["errors"].append({"asset": None, "error": str(exc)})
             return
         job["phase"] = "importing"
+        log.info("immich import %s: %d asset(s)", job_id, len(assets))
         await asyncio.gather(*(one(a) for a in assets))
     finally:
         await client.aclose()
         job["status"] = "done"
         if breaker.tripped:
             job["aborted"] = True
+        log.info("immich import %s done: %d added, %d skipped, %d failed", job_id, job["done"], job["skipped"], job["failed"])
 
 
 # ---------------------------------------------------------------------------
@@ -799,49 +846,21 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                     dt = it["source_timestamp"] or await asyncio.to_thread(_photo_datetime, path)
                     gps = await asyncio.to_thread(_photo_gps, path)
                     geo = await asyncio.to_thread(_reverse_geocode, gps[0], gps[1]) if gps else {}
-                    # Describe first; if it raises we keep the existing doc (no data loss).
-                    desc, vusage = await asyncio.wait_for(describe_image(path), VISION_TIMEOUT_S)
-                    _record_usage(vusage["model"], vusage["input"], vusage["output"])
-                    await asyncio.to_thread(_make_thumbnail, path, ext_id)
-                    place_parts = [geo.get("gps_city"), geo.get("gps_admin1"), geo.get("gps_country")]
-                    place_suffix = ", ".join(p for p in place_parts if p)
-                    base_content = desc["description"] or f"Photo: {path.name}"
-                    content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
-                    # remember() replaces in place when the external_id already exists
-                    # (khora's vectorcypher engine keeps the document id and re-runs
-                    # chunking/extraction) — never forget first: if remember fails or
-                    # times out, the existing doc must survive untouched.
-                    result = await asyncio.wait_for(kc.kb().remember(
-                        content=content,
-                        namespace=ns,
+                    # Shared pipeline; remember() replaces in place (never forget
+                    # first — a failure must leave the existing doc untouched).
+                    # Old custom seeds the rebuild so keys rescan doesn't
+                    # recompute (e.g. immich_asset_id) survive it.
+                    result = await _describe_and_remember(
+                        path,
+                        ext_id=ext_id,
                         title=it["title"] or path.name,
-                        source_type="photo",
-                        source_url=str(path.resolve()),
-                        source_timestamp=dt,
-                        external_id=ext_id,
-                        metadata={
-                            "custom": {
-                                # Old custom first, so keys this rescan doesn't
-                                # recompute (e.g. immich_asset_id) survive it.
-                                **_custom(it["metadata"]),
-                                "location": desc["location"],
-                                "objects": desc["objects"],
-                                "animals": desc["animals"],
-                                "scene": desc["scene"],
-                                "tags": desc["tags"],
-                                "occurred_at": dt.isoformat() if hasattr(dt, "isoformat") else str(dt),
-                                "filename": path.name,
-                                "gps_lat": gps[0] if gps else None,
-                                "gps_lon": gps[1] if gps else None,
-                                **geo,
-                            }
-                        },
-                        entity_types=ENTITY_TYPES,
-                        relationship_types=RELATIONSHIP_TYPES,
-                        expertise=PHOTO_EXPERTISE,
-                    ), REMEMBER_TIMEOUT_S)
+                        dt=dt,
+                        gps=gps,
+                        geo=geo,
+                        base_custom=_custom(it["metadata"]),
+                    )
                 else:  # extract: rebuild the entity graph from the stored description
-                    # Same in-place replace as above — remember() first, no forget.
+                    # Same in-place replace as describe — remember() first, no forget.
                     result = await asyncio.wait_for(kc.kb().remember(
                         content=it["content"] or f"Photo: {it['title'] or ''}",
                         namespace=ns,
@@ -855,6 +874,8 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         relationship_types=RELATIONSHIP_TYPES,
                         expertise=PHOTO_EXPERTISE,
                     ), REMEMBER_TIMEOUT_S)
+                    for u in result.llm_usage:
+                        _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
                 # A different id back means the old row wasn't replaced in place
                 # (it had no/another external_id) — it's a superseded leftover now.
                 # Removing it is cleanup, not data-critical: on failure we keep a
@@ -863,23 +884,25 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                     try:
                         await kc.kb().forget(it["doc_id"], namespace=ns)
                     except Exception as exc:
+                        log.warning("rescan %s: superseded copy %s not removed: %s", job_id, it["doc_id"], exc)
                         job["errors"].append({"doc_id": str(it["doc_id"]), "error": f"superseded copy not removed: {type(exc).__name__}: {exc}"})
-                for u in result.llm_usage:
-                    _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
                 _persist_usage()
                 job["done"] += 1
                 breaker.ok()
             except Exception as exc:
                 msg = "timed out" if isinstance(exc, asyncio.TimeoutError) else f"{type(exc).__name__}: {exc}"
+                log.warning("rescan %s: doc %s failed: %s", job_id, it["doc_id"], msg)
                 job["failed"] += 1
                 job["errors"].append({"doc_id": str(it["doc_id"]), "error": msg})
                 if breaker.fail():
+                    log.error("rescan %s aborted after %d consecutive failures", job_id, breaker.consec)
                     job["errors"].insert(0, {"error": f"Stopped after {breaker.consec} consecutive failures — the model may be unhealthy. Restart the app and try again."})
 
     await asyncio.gather(*(one(it) for it in items))
     job["status"] = "done"
     if breaker.tripped:
         job["aborted"] = True
+    log.info("rescan %s (%s) done: %d updated, %d skipped, %d failed", job_id, mode, job["done"], job["skipped"], job["failed"])
 
 
 # ---------------------------------------------------------------------------
