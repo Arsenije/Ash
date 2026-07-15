@@ -50,16 +50,19 @@ def _client(
     *,
     verify: bool = True,
     timeout: httpx.Timeout = _TIMEOUT,
+    transport: httpx.AsyncBaseTransport | None = None,
 ) -> httpx.AsyncClient:
     # base_url ends with "/api/" and every request path is RELATIVE (no leading
     # slash) — an absolute "/foo" path would drop the "/api" prefix under RFC
     # 3986 URL joining.
+    # ``transport`` exists for tests (httpx.MockTransport); None means real HTTP.
     return httpx.AsyncClient(
         base_url=f"{normalize_base_url(base_url)}/api/",
         headers={"x-api-key": api_key, "Accept": "application/json"},
         timeout=timeout,
         verify=verify,
         follow_redirects=True,
+        transport=transport,
     )
 
 
