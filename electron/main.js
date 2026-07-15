@@ -250,9 +250,7 @@ function modelsPresent(id = selectedChoiceId()) {
 
 // Fetch (or reuse from the shared HF cache) every model for a choice by running
 // download_models.py in the sidecar venv. Streams coarse per-file progress via
-// onProgress and resolves to { paths: { key: { repo, main, mmproj|null } },
-// cacheDir }. cacheDir is persisted so reapOrphans can match model servers by
-// their -m cache path.
+// onProgress and resolves to { key: { repo, main, mmproj|null } }.
 function runDownloader(id, onProgress) {
   return new Promise((resolve, reject) => {
     const spec = {
@@ -270,7 +268,6 @@ function runDownloader(id, onProgress) {
     });
     let buf = "";
     let result = null;
-    let cacheDir = "";
     let lastErr = "";
     child.stdout.on("data", (d) => {
       buf += d;
@@ -281,7 +278,6 @@ function runDownloader(id, onProgress) {
         try {
           const msg = JSON.parse(line);
           if (msg.result) result = msg.result;
-          else if (msg.cache) cacheDir = msg.cache;
           else if (msg.model) onProgress(msg);
         } catch {
           /* ignore non-JSON noise */
@@ -294,7 +290,7 @@ function runDownloader(id, onProgress) {
     });
     child.on("error", reject);
     child.on("exit", (code) => {
-      if (code === 0 && result) resolve({ paths: result, cacheDir });
+      if (code === 0 && result) resolve(result);
       else reject(new Error(lastErr.trim().split("\n").pop() || `model download exited ${code}`));
     });
   });
@@ -351,38 +347,84 @@ function killTree(proc, signal = "SIGTERM") {
 
 // Reap llama-swap / llama-server processes left over from a previous session that
 // didn't shut down cleanly (a crash or force-quit skips before-quit, so killTree
-// never ran). Matched by our own swap-config path (llama-swap's --config arg) and
-// the HF cache dir (our -m model paths live under it), so unrelated llama
-// processes are never touched. Run once at startup before spawning fresh ones —
-// accumulated orphans each hold GPU/unified memory and would starve the new
-// session's models (the embed-server starvation we saw).
+// never ran). Run once at startup before spawning fresh ones — accumulated
+// orphans each hold GPU/unified memory and would starve the new session's models
+// (the embed-server starvation we saw).
+//
+// Candidates come from two sources, and every candidate must ALSO pass
+// isRuntimeProcess before it is killed — reaping must never touch a process
+// that isn't ours (an earlier version matched the shared HF cache path and
+// could SIGKILL other apps' model servers, editors, scripts…):
+//   1. The process group persisted at spawn (settings.runtime_pgid): llama-swap
+//      is spawned detached, so its pid is the pgid and its llama-server
+//      children inherit it — the group survives even if llama-swap itself died
+//      and works across app updates that move the binaries.
+//   2. Fallback for orphans predating the pgid record: anything whose command
+//      line references our llama-swap config path (unique to this install).
+function isRuntimeProcess(pid) {
+  try {
+    // comm is the executable itself (not its arguments), so e.g. an editor
+    // that merely has llama-swap.yaml open can never pass this check.
+    const comm = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], { encoding: "utf8" }).trim();
+    return /(^|\/)llama-(server|swap)$/.test(comm);
+  } catch {
+    return false; // already exited
+  }
+}
+
+function pgrep(args) {
+  const pids = new Set();
+  try {
+    for (const line of execFileSync("pgrep", args, { encoding: "utf8" }).split("\n")) {
+      const pid = Number.parseInt(line, 10);
+      if (pid && pid !== process.pid) pids.add(pid);
+    }
+  } catch {
+    /* pgrep exits 1 when nothing matches */
+  }
+  return pids;
+}
+
 function reapOrphans() {
   if (process.platform === "win32") return; // pgrep is POSIX-only; Windows reap TODO
-  const pids = new Set();
-  for (const needle of [swapConfigPath, readSettings().hf_cache_dir].filter(Boolean)) {
-    try {
-      for (const line of execFileSync("pgrep", ["-f", needle], { encoding: "utf8" }).split("\n")) {
-        const pid = Number.parseInt(line, 10);
-        if (pid && pid !== process.pid) pids.add(pid);
-      }
-    } catch {
-      /* pgrep exits 1 when nothing matches */
-    }
+  const settings = readSettings();
+  const candidates = new Set();
+  const stalePgid = Number(settings.runtime_pgid) || 0;
+  if (stalePgid > 0) {
+    for (const pid of pgrep(["-g", String(stalePgid)])) candidates.add(pid);
   }
-  for (const pid of pids) {
+  // pgrep -f takes an extended regex; escape the path so it matches literally.
+  const escapedConfig = swapConfigPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  for (const pid of pgrep(["-f", escapedConfig])) candidates.add(pid);
+
+  let reaped = 0;
+  for (const pid of candidates) {
+    if (!isRuntimeProcess(pid)) continue; // never kill anything that isn't ours
     try {
       process.kill(pid, "SIGKILL");
+      reaped += 1;
     } catch {
       /* already gone */
     }
   }
-  if (pids.size) console.log(`reaped ${pids.size} orphaned runtime process(es) from a previous session`);
+  if (stalePgid) {
+    // Single-shot: a pgid is only ever acted on once, so a recycled id can't
+    // be re-matched on some later launch.
+    delete settings.runtime_pgid;
+    writeSettings(settings);
+  }
+  if (reaped) console.log(`reaped ${reaped} orphaned runtime process(es) from a previous session`);
 }
 
 function stopSwap() {
   if (llamaSwap) {
     killTree(llamaSwap);
     llamaSwap = null;
+    const s = readSettings();
+    if (s.runtime_pgid) {
+      delete s.runtime_pgid; // clean shutdown — nothing left to reap next launch
+      writeSettings(s);
+    }
   }
 }
 
@@ -396,6 +438,13 @@ async function startSwap() {
     stdio: ["ignore", "pipe", "pipe"],
     detached: process.platform !== "win32", // own process group, so killTree reaps its llama-server children
   });
+  if (process.platform !== "win32" && llamaSwap.pid) {
+    // detached => the child leads its own process group (pgid == pid). Persist
+    // it so a crashed session's whole group can be found and reaped next launch.
+    const s = readSettings();
+    s.runtime_pgid = llamaSwap.pid;
+    writeSettings(s);
+  }
   llamaSwap.stdout.on("data", (d) => process.stdout.write(`[swap] ${d}`));
   llamaSwap.stderr.on("data", (d) => process.stderr.write(`[swap] ${d}`));
   llamaSwap.on("exit", (code) => console.log(`[swap] exited ${code}`));
@@ -537,10 +586,9 @@ ipcMain.handle("download-models", async (e, choiceId) => {
   const id = choiceById(choiceId).id;
   const send = (p) => e.sender.send("model-download-progress", p);
   try {
-    const { paths, cacheDir } = await runDownloader(id, send);
+    const paths = await runDownloader(id, send);
     const s = readSettings();
     s.model_paths = { ...(s.model_paths || {}), ...paths };
-    if (cacheDir) s.hf_cache_dir = cacheDir;
     writeSettings(s);
     return { ok: true };
   } catch (err) {
