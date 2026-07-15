@@ -802,7 +802,10 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                     place_suffix = ", ".join(p for p in place_parts if p)
                     base_content = desc["description"] or f"Photo: {path.name}"
                     content = f"{base_content} [{place_suffix}]" if place_suffix else base_content
-                    await kc.kb().forget(it["doc_id"], namespace=ns)
+                    # remember() replaces in place when the external_id already exists
+                    # (khora's vectorcypher engine keeps the document id and re-runs
+                    # chunking/extraction) — never forget first: if remember fails or
+                    # times out, the existing doc must survive untouched.
                     result = await asyncio.wait_for(kc.kb().remember(
                         content=content,
                         namespace=ns,
@@ -813,6 +816,9 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         external_id=ext_id,
                         metadata={
                             "custom": {
+                                # Old custom first, so keys this rescan doesn't
+                                # recompute (e.g. immich_asset_id) survive it.
+                                **_custom(it["metadata"]),
                                 "location": desc["location"],
                                 "objects": desc["objects"],
                                 "animals": desc["animals"],
@@ -830,7 +836,7 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         expertise=PHOTO_EXPERTISE,
                     ), REMEMBER_TIMEOUT_S)
                 else:  # extract: rebuild the entity graph from the stored description
-                    await kc.kb().forget(it["doc_id"], namespace=ns)
+                    # Same in-place replace as above — remember() first, no forget.
                     result = await asyncio.wait_for(kc.kb().remember(
                         content=it["content"] or f"Photo: {it['title'] or ''}",
                         namespace=ns,
@@ -844,6 +850,15 @@ async def _run_rescan(job_id: str, items: list[dict[str, Any]], mode: str) -> No
                         relationship_types=RELATIONSHIP_TYPES,
                         expertise=PHOTO_EXPERTISE,
                     ), REMEMBER_TIMEOUT_S)
+                # A different id back means the old row wasn't replaced in place
+                # (it had no/another external_id) — it's a superseded leftover now.
+                # Removing it is cleanup, not data-critical: on failure we keep a
+                # transient duplicate rather than ever risking the photo.
+                if str(result.document_id) != str(it["doc_id"]):
+                    try:
+                        await kc.kb().forget(it["doc_id"], namespace=ns)
+                    except Exception as exc:
+                        job["errors"].append({"doc_id": str(it["doc_id"]), "error": f"superseded copy not removed: {type(exc).__name__}: {exc}"})
                 for u in result.llm_usage:
                     _record_usage(u.model, u.prompt_tokens, u.completion_tokens)
                 _persist_usage()

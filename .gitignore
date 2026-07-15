@@ -6,7 +6,7 @@ out/
 *.log
 
 # Python sidecar
-sidecar/.venv
+sidecar/.venv*
 __pycache__/
 *.pyc
 
