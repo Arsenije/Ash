@@ -112,6 +112,17 @@ _client: AsyncOpenAI | None = None
 def _get_client() -> AsyncOpenAI:
     global _client
     if _client is None:
+        # Local-first guard: without a base URL the SDK would default to
+        # api.openai.com and silently UPLOAD photos to a hosted service the
+        # moment an ambient OPENAI_API_KEY is set (a very common shell state).
+        # The Ash app always points OPENAI_BASE_URL at its local llama-swap;
+        # standalone runs must do the same or opt in to the cloud explicitly.
+        if not os.environ.get("OPENAI_BASE_URL") and os.environ.get("PHOTO_ALLOW_CLOUD") != "1":
+            raise RuntimeError(
+                "No OPENAI_BASE_URL configured — refusing to send photos to hosted "
+                "OpenAI by default. Point OPENAI_BASE_URL at a local server (the Ash "
+                "app does this automatically), or set PHOTO_ALLOW_CLOUD=1 to opt in."
+            )
         _client = AsyncOpenAI()  # reads OPENAI_API_KEY from env
     return _client
 
