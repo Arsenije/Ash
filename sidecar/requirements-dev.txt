@@ -1,0 +1,10 @@
+# Test-only deps — NOT installed for end users (setup installs requirements.txt).
+# Run the suite with a dev venv:
+#   uv venv sidecar/.venv-dev --python 3.13
+#   uv pip install --python sidecar/.venv-dev/bin/python \
+#     -r sidecar/requirements.txt -r sidecar/requirements-dev.txt
+#   sidecar/.venv-dev/bin/python -m pytest sidecar/tests
+# khora itself is NOT needed: tests/conftest.py installs a lightweight fake
+# (khora[embedded] pulls in torch — far too heavy for a test venv).
+pytest
+pytest-asyncio
