@@ -16,9 +16,13 @@ contextBridge.exposeInMainWorld("api", {
   },
   pickPaths: () => ipcRenderer.invoke("pick-paths"),
   reveal: (p) => ipcRenderer.invoke("reveal", p),
-  // Immich connection settings (persisted in main; API key encrypted at rest).
+  // Immich connection (persisted in main; the API key is encrypted at rest and
+  // never handed to this renderer — immichGet reports only hasKey, and the
+  // immich calls are proxied through main, which injects the stored key).
   immichGet: () => ipcRenderer.invoke("immich-get"),
-  immichSave: (cfg) => ipcRenderer.invoke("immich-save", cfg),
+  immichTest: (cfg) => ipcRenderer.invoke("immich-test", cfg),
+  immichAlbums: (cfg) => ipcRenderer.invoke("immich-albums", cfg),
+  immichImport: (payload) => ipcRenderer.invoke("immich-import", payload),
   immichClear: () => ipcRenderer.invoke("immich-clear"),
   // Resolve absolute filesystem paths for dragged-in File objects.
   // file.path was removed in Electron 32+; webUtils.getPathForFile is the replacement.

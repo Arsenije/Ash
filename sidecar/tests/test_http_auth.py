@@ -43,10 +43,28 @@ async def test_header_token_passes(client, token, fake_kb):
     assert res.json()["status"] == "ok"
 
 
-async def test_query_param_token_passes(client, token, fake_kb):
-    # <img> elements can't set headers; the renderer appends ?token= instead.
-    res = await client.get(f"/health?token={token}")
-    assert res.status_code == 200
+async def test_query_param_token_passes_for_media_only(client, token, fake_kb):
+    # <img> elements can't set headers; the renderer appends ?token= instead —
+    # but only /thumb and /image accept it (query strings leak more easily
+    # than headers, so every other route requires the header).
+    (kc.THUMBS_DIR / "beef01.webp").write_bytes(b"webp-ish")
+    media = await client.get(f"/thumb/beef01?token={token}")
+    assert media.status_code == 200
+
+    api = await client.get(f"/health?token={token}")
+    assert api.status_code == 401
+
+
+async def test_tokenless_mode_refuses_browser_origins(client, fake_kb, monkeypatch):
+    # Standalone dev runs (no token) are for loopback tools; a request carrying
+    # an Origin header comes from a web page and must be refused outright —
+    # with the gate down it could otherwise read the whole library.
+    monkeypatch.setattr(server, "SIDECAR_TOKEN", "")
+    page = await client.get("/health", headers={"Origin": "https://evil.example"})
+    assert page.status_code == 403
+
+    tool = await client.get("/health")  # curl/httpx — no Origin header
+    assert tool.status_code == 200
 
 
 async def test_options_preflight_bypasses_token(client, token):
@@ -69,17 +87,17 @@ async def test_empty_token_env_disables_gate(client, fake_kb, monkeypatch):
     assert res.status_code == 200
 
 
-async def test_thumb_only_serves_hex_named_files(client, fake_kb, tmp_path):
+async def test_thumb_only_serves_hex_named_files(client, token, fake_kb, tmp_path):
     (kc.THUMBS_DIR / "abc123.webp").write_bytes(b"not-really-webp")
-    ok = await client.get("/thumb/abc123")
+    ok = await client.get("/thumb/abc123", headers={"X-Ash-Token": token})
     assert ok.status_code == 200
 
     # Anything but [0-9a-f] is stripped before the path is built, so traversal
     # can't escape THUMBS_DIR.
-    evil = await client.get("/thumb/..%2F..%2Fetc%2Fpasswd")
+    evil = await client.get("/thumb/..%2F..%2Fetc%2Fpasswd", headers={"X-Ash-Token": token})
     assert evil.status_code == 404
 
 
-async def test_photo_malformed_uuid_is_404_not_500(client, fake_kb):
-    res = await client.get("/photo/not-a-uuid")
+async def test_photo_malformed_uuid_is_404_not_500(client, token, fake_kb):
+    res = await client.get("/photo/not-a-uuid", headers={"X-Ash-Token": token})
     assert res.status_code == 404

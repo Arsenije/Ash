@@ -99,29 +99,48 @@ app = FastAPI(title="photo-gallery sidecar", lifespan=_lifespan)
 # gate is disabled, matching the loopback-only, single-user assumption.
 SIDECAR_TOKEN = os.environ.get("PHOTO_SIDECAR_TOKEN", "")
 
+# Only media routes may authenticate via ?token= — <img> elements can't set
+# headers. Everything else must use the X-Ash-Token header: query strings leak
+# into more places than headers (copied URLs, DOM snapshots, any future access
+# logging), so their use is kept to the endpoints that have no alternative.
+_QUERY_TOKEN_PATHS = ("/thumb/", "/image/")
+
 
 @app.middleware("http")
 async def _require_token(request: Request, call_next):
-    # The renderer sends the token as a header on fetch() and as a ?token= query
-    # param on <img> URLs (image elements can't set custom headers). Preflight
-    # (OPTIONS) carries neither and must pass through to CORS handling.
-    if SIDECAR_TOKEN and request.method != "OPTIONS":
-        supplied = request.headers.get("x-ash-token") or request.query_params.get("token") or ""
-        if not hmac.compare_digest(supplied, SIDECAR_TOKEN):
-            return JSONResponse({"detail": "unauthorized"}, status_code=401)
+    # Preflight (OPTIONS) carries no credentials and must pass through to CORS
+    # handling; the browser never exposes its response body anyway.
+    if request.method != "OPTIONS":
+        if SIDECAR_TOKEN:
+            supplied = request.headers.get("x-ash-token") or ""
+            if not supplied and request.url.path.startswith(_QUERY_TOKEN_PATHS):
+                supplied = request.query_params.get("token") or ""
+            if not hmac.compare_digest(supplied, SIDECAR_TOKEN):
+                return JSONResponse({"detail": "unauthorized"}, status_code=401)
+        elif request.headers.get("origin") is not None:
+            # Tokenless mode (standalone `uvicorn server:app` for dev) is meant
+            # for loopback tools like curl/httpx. A request bearing an Origin
+            # header comes from a browser page — with no token gate it could
+            # read the whole library (or blind-fire ingest/rescan POSTs), so
+            # refuse browser-originated requests outright in this mode.
+            return JSONResponse(
+                {"detail": "browser requests require the app session token"}, status_code=403
+            )
     return await call_next(request)
 
 
-# CORS must stay permissive: the renderer is a file:// page, so every request to
-# this http://127.0.0.1 service is cross-origin (Origin: null). The access
-# boundary is the token above, not the origin — a page that lacks the token gets
-# 401 regardless of whether it could read the response.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# CORS must be permissive for the app: the renderer is a file:// page, so every
+# request to this http://127.0.0.1 service is cross-origin (Origin: null). The
+# access boundary is the token above, not the origin — a page lacking the token
+# gets 401 regardless. Tokenless (dev) runs get NO CORS at all: without the
+# token gate, an allow-all CORS policy would let any web page read the library.
+if SIDECAR_TOKEN:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
 # In-memory ingest job tracking (single-user desktop app).
 _jobs: dict[str, dict[str, Any]] = {}
